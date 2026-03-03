@@ -1,6 +1,12 @@
 {
   "stories": [
     {
+      "id": "picoclaw-security",
+      "title": "Is PicoClaw Safe on a Remote Instance? A Security Audit Tour",
+      "commitHash": "946af6b53db371a1dba5a09ae52ca3c034d65086",
+      "createdAt": "2026-03-03T12:00:00.000Z"
+    },
+    {
       "id": "e9480ae6-e9df-4f22-b42f-33dd5dfe2c7a",
       "title": "Why GoClaw Requires an API Key (No Claude Code CLI Support)",
       "commitHash": "ced0d28b487605f7d3721f577c7c299ad46f5944",

@@ -1,0 +1,232 @@
+{
+  "id": "picoclaw-security",
+  "title": "Is PicoClaw Safe on a Remote Instance? A Security Audit Tour",
+  "query": "Is picoclaw safe to use for personal research on a remote instance? Highlight potential security gotchas for such use.",
+  "repo": "sipeed/picoclaw",
+  "commitHash": "946af6b53db371a1dba5a09ae52ca3c034d65086",
+  "createdAt": "2026-03-03T12:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "Security Overview",
+      "snippets": [],
+      "explanation": "PicoClaw is an ultra-lightweight AI assistant written in Go, designed to run on hardware as modest as a $10 RISC-V board with under 10MB of RAM. It operates through a **gateway** — a long-running process that connects messaging channels (Telegram, Discord, etc.) to an LLM agent capable of executing tools like shell commands and file operations. A separate **launcher** binary provides a web-based configuration editor.\n\nFor security, PicoClaw relies on several layers: **workspace sandboxing** confines file operations to a designated directory, **deny patterns** block dangerous shell commands via regex matching, and **allow_from** lists restrict which users can interact through messaging channels. The critical question for remote research use is whether these protections — designed with local, single-user deployment in mind — hold up when the instance is reachable over a network.\n\nThe short answer: PicoClaw is reasonably safe for personal research, but its security model assumes trusted-network access. Deploying it on a remote instance introduces gotchas that range from \"easily fixable\" to \"architecturally missing.\" Let's walk through them."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Launcher Binding",
+      "snippets": [
+        {
+          "filePath": "cmd/picoclaw-launcher/main.go",
+          "startLine": 33,
+          "endLine": 35,
+          "content": "func main() {\n\tpublic := flag.Bool(\"public\", false, \"Listen on all interfaces (0.0.0.0) instead of localhost only\")\n\tflag.Usage = func() {"
+        },
+        {
+          "filePath": "cmd/picoclaw-launcher/main.go",
+          "startLine": 51,
+          "endLine": 68,
+          "content": "\tflag.Parse()\n\n\tconfigPath := server.DefaultConfigPath()\n\tif flag.NArg() > 0 {\n\t\tconfigPath = flag.Arg(0)\n\t}\n\n\tabsPath, err := filepath.Abs(configPath)\n\tif err != nil {\n\t\tlog.Fatalf(\"Failed to resolve config path: %v\", err)\n\t}\n\n\tvar addr string\n\tif *public {\n\t\taddr = \"0.0.0.0:\" + server.DefaultPort\n\t} else {\n\t\taddr = \"127.0.0.1:\" + server.DefaultPort\n\t}"
+        }
+      ],
+      "explanation": "The launcher's `main()` function reveals the first security decision worth scrutinizing. Line 34 defines a `-public` flag that controls whether the HTTP server listens on localhost only or all network interfaces. Lines 63–68 show the binary choice: `127.0.0.1` by default, or `0.0.0.0` with `-public`. Between these two snippets (lines 35–50), the flag.Usage section prints help text we can skip over.\n\nOn a local machine, binding to `127.0.0.1` is sufficient protection — only processes on the same host can connect. But on a remote VPS, you might be tempted to use `-public` so you can access the config editor from your laptop. The problem is that there is zero authentication middleware anywhere in the launcher. No password, no API key, no session token. The localhost binding *is* the entire security boundary, and `-public` removes it completely."
+    },
+    {
+      "id": "chapter-2",
+      "label": "Unauthenticated APIs",
+      "snippets": [
+        {
+          "filePath": "cmd/picoclaw-launcher/internal/server/server.go",
+          "startLine": 30,
+          "endLine": 48,
+          "content": "func RegisterConfigAPI(mux *http.ServeMux, absPath string) {\n\t// GET /api/config — read config\n\tmux.HandleFunc(\"GET /api/config\", func(w http.ResponseWriter, r *http.Request) {\n\t\tcfg, err := config.LoadConfig(absPath)\n\t\tif err != nil {\n\t\t\thttp.Error(w, fmt.Sprintf(\"Failed to load config: %v\", err), http.StatusInternalServerError)\n\t\t\treturn\n\t\t}\n\t\tw.Header().Set(\"Content-Type\", \"application/json\")\n\t\tresp := map[string]any{\n\t\t\t\"config\": cfg,\n\t\t\t\"path\":   absPath,\n\t\t}\n\t\tenc := json.NewEncoder(w)\n\t\tenc.SetIndent(\"\", \"  \")\n\t\tif err := enc.Encode(resp); err != nil {\n\t\t\tlog.Printf(\"Failed to encode response: %v\", err)\n\t\t}\n\t})"
+        }
+      ],
+      "explanation": "`RegisterConfigAPI` makes the stakes of that binding decision concrete. Lines 32–47 show the GET handler: it calls `config.LoadConfig`, serializes the entire `Config` struct — including every API key, every bot token, every OAuth credential reference — and sends it back as JSON. No authentication check, no redaction of sensitive fields, no rate limiting.\n\nThe PUT handler (not shown, immediately following at lines 51–72) is equally open: anyone can submit a new configuration, and it will be written directly to disk via `config.SaveConfig`. An attacker could inject their own API keys, change the LLM provider to a malicious endpoint, or disable security features. The `io.LimitReader` on that handler caps request bodies at 1MB, which prevents memory exhaustion, but that's the only defensive measure. If the launcher is network-accessible, your entire PicoClaw configuration becomes an open read-write API for anyone who can reach the port."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Credential Storage",
+      "snippets": [
+        {
+          "filePath": "pkg/auth/store.go",
+          "startLine": 12,
+          "endLine": 25,
+          "content": "type AuthCredential struct {\n\tAccessToken  string    `json:\"access_token\"`\n\tRefreshToken string    `json:\"refresh_token,omitempty\"`\n\tAccountID    string    `json:\"account_id,omitempty\"`\n\tExpiresAt    time.Time `json:\"expires_at,omitempty\"`\n\tProvider     string    `json:\"provider\"`\n\tAuthMethod   string    `json:\"auth_method\"`\n\tEmail        string    `json:\"email,omitempty\"`\n\tProjectID    string    `json:\"project_id,omitempty\"`\n}\n\ntype AuthStore struct {\n\tCredentials map[string]*AuthCredential `json:\"credentials\"`\n}"
+        },
+        {
+          "filePath": "pkg/auth/store.go",
+          "startLine": 41,
+          "endLine": 44,
+          "content": "func authFilePath() string {\n\thome, _ := os.UserHomeDir()\n\treturn filepath.Join(home, \".picoclaw\", \"auth.json\")\n}"
+        },
+        {
+          "filePath": "pkg/auth/store.go",
+          "startLine": 66,
+          "endLine": 75,
+          "content": "func SaveStore(store *AuthStore) error {\n\tpath := authFilePath()\n\tdata, err := json.MarshalIndent(store, \"\", \"  \")\n\tif err != nil {\n\t\treturn err\n\t}\n\n\t// Use unified atomic write utility with explicit sync for flash storage reliability.\n\treturn fileutil.WriteFileAtomic(path, data, 0o600)\n}"
+        }
+      ],
+      "explanation": "`AuthCredential` on lines 12–21 holds the crown jewels: access tokens, refresh tokens, account IDs, and emails. The `AuthStore` on lines 23–25 is simply a map of provider name to credential. Everything is stored as plaintext JSON at `~/.picoclaw/auth.json` (line 43).\n\nThe saving grace is `SaveStore` on lines 66–75: it uses `fileutil.WriteFileAtomic` with mode `0o600`, meaning only the file owner can read or write it. The atomic write pattern (write to temp file, fsync, rename) protects against corruption on flash storage — a practical necessity for PicoClaw's target hardware. But `0o600` is the *only* protection. There's no encryption, no keyring integration, no OS credential store. On a shared remote instance, any process running as the same user can read these tokens."
+    },
+    {
+      "id": "chapter-4",
+      "label": "OAuth Redirect Risk",
+      "snippets": [
+        {
+          "filePath": "cmd/picoclaw-launcher/internal/server/auth_handlers.go",
+          "startLine": 168,
+          "endLine": 185,
+          "content": "func handleGoogleAntigravityLogin(w http.ResponseWriter, r *http.Request, configPath string) {\n\toauthCfg := auth.GoogleAntigravityOAuthConfig()\n\n\tpkce, err := auth.GeneratePKCE()\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Failed to generate PKCE: %v\", err), http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\tstate, err := auth.GenerateState()\n\tif err != nil {\n\t\thttp.Error(w, fmt.Sprintf(\"Failed to generate state: %v\", err), http.StatusInternalServerError)\n\t\treturn\n\t}\n\n\t// Build redirect URI pointing to picoclaw-launcher's own callback\n\tscheme := \"http\"\n\tredirectURI := fmt.Sprintf(\"%s://%s/auth/callback\", scheme, r.Host)"
+        },
+        {
+          "filePath": "cmd/picoclaw-launcher/internal/server/auth_handlers.go",
+          "startLine": 234,
+          "endLine": 243,
+          "content": "\tif code == \"\" {\n\t\terrMsg := r.URL.Query().Get(\"error\")\n\t\tw.Header().Set(\"Content-Type\", \"text/html\")\n\t\tfmt.Fprintf(\n\t\t\tw,\n\t\t\t`<html><body><h2>Authentication failed</h2><p>%s</p><p>You can close this window.</p></body></html>`,\n\t\t\terrMsg,\n\t\t)\n\t\treturn\n\t}"
+        }
+      ],
+      "explanation": "When you initiate a Google Antigravity OAuth login through the launcher, `handleGoogleAntigravityLogin` constructs the redirect URI. Line 184 hard-codes the scheme to `\"http\"`, and line 185 builds the full callback URL using the request's Host header. On a remote instance, this means your OAuth authorization code travels over the network in cleartext — anyone sniffing traffic between the Google redirect and your server can intercept it.\n\nThe second risk appears in `handleOAuthCallback` (the second snippet, from the same file). Lines 235–241 take the `error` query parameter from the OAuth provider and embed it directly into an HTML response via `fmt.Fprintf` with a `%s` verb. There's no HTML escaping. A crafted error parameter like `<script>alert('xss')</script>` would execute in the user's browser. In practice, legitimate OAuth providers won't send malicious error messages, but this is a textbook reflected XSS vulnerability. On a remote instance where others might craft links pointing to your callback endpoint, this becomes exploitable."
+    },
+    {
+      "id": "chapter-5",
+      "label": "Embedded Secrets",
+      "snippets": [
+        {
+          "filePath": "pkg/auth/oauth.go",
+          "startLine": 45,
+          "endLine": 59,
+          "content": "func GoogleAntigravityOAuthConfig() OAuthProviderConfig {\n\t// These are the same client credentials used by the OpenCode antigravity plugin.\n\tclientID := decodeBase64(\n\t\t\"<REDACTED_BASE64_CLIENT_ID>\",\n\t)\n\tclientSecret := decodeBase64(\"<REDACTED_BASE64_CLIENT_SECRET>\")\n\treturn OAuthProviderConfig{\n\t\tIssuer:       \"https://accounts.google.com/o/oauth2/v2\",\n\t\tTokenURL:     \"https://oauth2.googleapis.com/token\",\n\t\tClientID:     clientID,\n\t\tClientSecret: clientSecret,\n\t\tScopes:       \"https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/cclog https://www.googleapis.com/auth/experimentsandconfigs\",\n\t\tPort:         51121,\n\t}\n}"
+        }
+      ],
+      "explanation": "`GoogleAntigravityOAuthConfig` stores its OAuth client credentials as base64-encoded strings (lines 47–50). The `decodeBase64` helper simply runs `base64.StdEncoding.DecodeString` — this is obfuscation, not encryption. Anyone with access to the source or binary can decode them. This is actually standard practice for public OAuth clients (mobile apps, CLI tools) where the client secret cannot truly be kept secret. It's not a vulnerability per se, but worth knowing: these credentials identify the *application*, not the user."
+    },
+    {
+      "id": "chapter-6",
+      "label": "Deny Pattern Wall",
+      "snippets": [
+        {
+          "filePath": "pkg/tools/shell.go",
+          "startLine": 29,
+          "endLine": 77,
+          "content": "\tdefaultDenyPatterns = []*regexp.Regexp{\n\t\tregexp.MustCompile(`\\brm\\s+-[rf]{1,2}\\b`),\n\t\tregexp.MustCompile(`\\bdel\\s+/[fq]\\b`),\n\t\tregexp.MustCompile(`\\brmdir\\s+/s\\b`),\n\t\t// Match disk wiping commands (must be followed by space/args)\n\t\tregexp.MustCompile(\n\t\t\t`\\b(format|mkfs|diskpart)\\b\\s`,\n\t\t),\n\t\tregexp.MustCompile(`\\bdd\\s+if=`),\n\t\t// Block writes to block devices (all common naming schemes).\n\t\tregexp.MustCompile(\n\t\t\t`>\\s*/dev/(sd[a-z]|hd[a-z]|vd[a-z]|xvd[a-z]|nvme\\d|mmcblk\\d|loop\\d|dm-\\d|md\\d|sr\\d|nbd\\d)`,\n\t\t),\n\t\tregexp.MustCompile(`\\b(shutdown|reboot|poweroff)\\b`),\n\t\tregexp.MustCompile(`:\\(\\)\\s*\\{.*\\};\\s*:`),\n\t\tregexp.MustCompile(`\\$\\([^)]+\\)`),\n\t\tregexp.MustCompile(`\\$\\{[^}]+\\}`),\n\t\tregexp.MustCompile(\"`[^`]+`\"),\n\t\tregexp.MustCompile(`\\|\\s*sh\\b`),\n\t\tregexp.MustCompile(`\\|\\s*bash\\b`),\n\t\tregexp.MustCompile(`;\\s*rm\\s+-[rf]`),\n\t\tregexp.MustCompile(`&&\\s*rm\\s+-[rf]`),\n\t\tregexp.MustCompile(`\\|\\|\\s*rm\\s+-[rf]`),\n\t\tregexp.MustCompile(`<<\\s*EOF`),\n\t\tregexp.MustCompile(`\\$\\(\\s*cat\\s+`),\n\t\tregexp.MustCompile(`\\$\\(\\s*curl\\s+`),\n\t\tregexp.MustCompile(`\\$\\(\\s*wget\\s+`),\n\t\tregexp.MustCompile(`\\$\\(\\s*which\\s+`),\n\t\tregexp.MustCompile(`\\bsudo\\b`),\n\t\tregexp.MustCompile(`\\bchmod\\s+[0-7]{3,4}\\b`),\n\t\tregexp.MustCompile(`\\bchown\\b`),\n\t\tregexp.MustCompile(`\\bpkill\\b`),\n\t\tregexp.MustCompile(`\\bkillall\\b`),\n\t\tregexp.MustCompile(`\\bkill\\s+-[9]\\b`),\n\t\tregexp.MustCompile(`\\bcurl\\b.*\\|\\s*(sh|bash)`),\n\t\tregexp.MustCompile(`\\bwget\\b.*\\|\\s*(sh|bash)`),\n\t\tregexp.MustCompile(`\\bnpm\\s+install\\s+-g\\b`),\n\t\tregexp.MustCompile(`\\bpip\\s+install\\s+--user\\b`),\n\t\tregexp.MustCompile(`\\bapt\\s+(install|remove|purge)\\b`),\n\t\tregexp.MustCompile(`\\byum\\s+(install|remove)\\b`),\n\t\tregexp.MustCompile(`\\bdnf\\s+(install|remove)\\b`),\n\t\tregexp.MustCompile(`\\bdocker\\s+run\\b`),\n\t\tregexp.MustCompile(`\\bdocker\\s+exec\\b`),\n\t\tregexp.MustCompile(`\\bgit\\s+push\\b`),\n\t\tregexp.MustCompile(`\\bgit\\s+force\\b`),\n\t\tregexp.MustCompile(`\\bssh\\b.*@`),\n\t\tregexp.MustCompile(`\\beval\\b`),\n\t\tregexp.MustCompile(`\\bsource\\s+.*\\.sh\\b`),\n\t}"
+        }
+      ],
+      "explanation": "Over 40 compiled regex patterns form PicoClaw's first line of defense against dangerous shell commands. The array covers destructive commands (`rm -rf` on line 30, `dd if=` on line 37, `mkfs` on line 35), privilege escalation (`sudo` on line 57, `chmod` on line 58, `chown` on line 59), and escape vectors — three patterns on lines 44–46 block all forms of shell command substitution (`$(cmd)`, `${var}`, and backtick syntax), preventing an LLM from constructing commands that dynamically evaluate arbitrary input.\n\nThe patterns also block network-dangerous operations: `git push` (line 72), `ssh` connections (line 74), `docker run` (line 70), and package managers like `apt install` (line 67). Line 43 even catches the classic fork bomb pattern `:(){ ... };:`.\n\nHowever, this is fundamentally a denylist approach. It catches known-dangerous patterns but cannot anticipate every harmful command. A sufficiently creative command that avoids all 40+ patterns would pass through. For personal research this is a reasonable tradeoff, but it's not a security boundary you'd rely on for untrusted input."
+    },
+    {
+      "id": "chapter-7",
+      "label": "Disabling Guards",
+      "snippets": [
+        {
+          "filePath": "pkg/tools/shell.go",
+          "startLine": 100,
+          "endLine": 142,
+          "content": "func NewExecToolWithConfig(workingDir string, restrict bool, config *config.Config) (*ExecTool, error) {\n\tdenyPatterns := make([]*regexp.Regexp, 0)\n\tcustomAllowPatterns := make([]*regexp.Regexp, 0)\n\n\tif config != nil {\n\t\texecConfig := config.Tools.Exec\n\t\tenableDenyPatterns := execConfig.EnableDenyPatterns\n\t\tif enableDenyPatterns {\n\t\t\tdenyPatterns = append(denyPatterns, defaultDenyPatterns...)\n\t\t\tif len(execConfig.CustomDenyPatterns) > 0 {\n\t\t\t\tfmt.Printf(\"Using custom deny patterns: %v\\n\", execConfig.CustomDenyPatterns)\n\t\t\t\tfor _, pattern := range execConfig.CustomDenyPatterns {\n\t\t\t\t\tre, err := regexp.Compile(pattern)\n\t\t\t\t\tif err != nil {\n\t\t\t\t\t\treturn nil, fmt.Errorf(\"invalid custom deny pattern %q: %w\", pattern, err)\n\t\t\t\t\t}\n\t\t\t\t\tdenyPatterns = append(denyPatterns, re)\n\t\t\t\t}\n\t\t\t}\n\t\t} else {\n\t\t\t// If deny patterns are disabled, we won't add any patterns, allowing all commands.\n\t\t\tfmt.Println(\"Warning: deny patterns are disabled. All commands will be allowed.\")\n\t\t}\n\t\tfor _, pattern := range execConfig.CustomAllowPatterns {\n\t\t\tre, err := regexp.Compile(pattern)\n\t\t\tif err != nil {\n\t\t\t\treturn nil, fmt.Errorf(\"invalid custom allow pattern %q: %w\", pattern, err)\n\t\t\t}\n\t\t\tcustomAllowPatterns = append(customAllowPatterns, re)\n\t\t}\n\t} else {\n\t\tdenyPatterns = append(denyPatterns, defaultDenyPatterns...)\n\t}\n\n\treturn &ExecTool{\n\t\tworkingDir:          workingDir,\n\t\ttimeout:             60 * time.Second,\n\t\tdenyPatterns:        denyPatterns,\n\t\tallowPatterns:       nil,\n\t\tcustomAllowPatterns: customAllowPatterns,\n\t\trestrictToWorkspace: restrict,\n\t}, nil\n}"
+        }
+      ],
+      "explanation": "`NewExecToolWithConfig` reveals a critical configuration knob. Lines 104–122 check `config.Tools.Exec.EnableDenyPatterns`: when true, the full deny pattern list is loaded (line 108); when false, the function prints a warning on line 121 and proceeds with an *empty* deny list, allowing all commands through.\n\nLines 123–129 show that custom allow patterns are always loaded regardless of the deny flag. And on line 131, when no config is provided at all, the default deny patterns are used as a fallback — so a nil config is actually safer than an explicit `enable_deny_patterns: false`.\n\nThe practical risk for remote research: if someone gains write access to your config file (which is trivial if the launcher is exposed, as we saw in Chapter 2), they can set `enable_deny_patterns: false` and remove all shell safety guards. The config API and the deny-pattern toggle create a chain of vulnerabilities that's more dangerous than either one alone."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Guard Bypass Flow",
+      "snippets": [
+        {
+          "filePath": "pkg/tools/shell.go",
+          "startLine": 290,
+          "endLine": 309,
+          "content": "func (t *ExecTool) guardCommand(command, cwd string) string {\n\tcmd := strings.TrimSpace(command)\n\tlower := strings.ToLower(cmd)\n\n\t// Custom allow patterns exempt a command from deny checks.\n\texplicitlyAllowed := false\n\tfor _, pattern := range t.customAllowPatterns {\n\t\tif pattern.MatchString(lower) {\n\t\t\texplicitlyAllowed = true\n\t\t\tbreak\n\t\t}\n\t}\n\n\tif !explicitlyAllowed {\n\t\tfor _, pattern := range t.denyPatterns {\n\t\t\tif pattern.MatchString(lower) {\n\t\t\t\treturn \"Command blocked by safety guard (dangerous pattern detected)\"\n\t\t\t}\n\t\t}\n\t}"
+        }
+      ],
+      "explanation": "`guardCommand` shows the runtime evaluation order. Lines 294–301 check custom allow patterns first — if *any* match, the variable `explicitlyAllowed` is set to true and the command skips all deny checks entirely on lines 303–309. This means a single overly broad allow pattern like `.*` would effectively disable the entire deny list without touching the config flag.\n\nAfter this snippet, the function continues (not shown) with workspace path restriction: it catches explicit path traversal via `../` and validates that absolute paths in the command resolve within the working directory. That workspace restriction is the last line of defense after pattern matching. The key insight: allow patterns take *absolute priority* over deny patterns. If you're configuring PicoClaw for remote use, treat custom allow patterns with the same caution you'd give sudo rules."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Filesystem Sandbox",
+      "snippets": [
+        {
+          "filePath": "pkg/tools/filesystem.go",
+          "startLine": 282,
+          "endLine": 303,
+          "content": "type sandboxFs struct {\n\tworkspace string\n}\n\nfunc (r *sandboxFs) execute(path string, fn func(root *os.Root, relPath string) error) error {\n\tif r.workspace == \"\" {\n\t\treturn fmt.Errorf(\"workspace is not defined\")\n\t}\n\n\troot, err := os.OpenRoot(r.workspace)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"failed to open workspace: %w\", err)\n\t}\n\tdefer root.Close()\n\n\trelPath, err := getSafeRelPath(r.workspace, path)\n\tif err != nil {\n\t\treturn err\n\t}\n\n\treturn fn(root, relPath)\n}"
+        },
+        {
+          "filePath": "pkg/tools/filesystem.go",
+          "startLine": 305,
+          "endLine": 323,
+          "content": "func (r *sandboxFs) ReadFile(path string) ([]byte, error) {\n\tvar content []byte\n\terr := r.execute(path, func(root *os.Root, relPath string) error {\n\t\tfileContent, err := root.ReadFile(relPath)\n\t\tif err != nil {\n\t\t\tif os.IsNotExist(err) {\n\t\t\t\treturn fmt.Errorf(\"failed to read file: file not found: %w\", err)\n\t\t\t}\n\t\t\t// os.Root returns \"escapes from parent\" for paths outside the root\n\t\t\tif os.IsPermission(err) || strings.Contains(err.Error(), \"escapes from parent\") ||\n\t\t\t\tstrings.Contains(err.Error(), \"permission denied\") {\n\t\t\t\treturn fmt.Errorf(\"failed to read file: access denied: %w\", err)\n\t\t\t}\n\t\t\treturn fmt.Errorf(\"failed to read file: %w\", err)\n\t\t}\n\t\tcontent = fileContent\n\t\treturn nil\n\t})\n\treturn content, err"
+        }
+      ],
+      "explanation": "Here lives PicoClaw's strongest security boundary. The `sandboxFs` struct (lines 282–284) wraps a workspace path, and the `execute` method (lines 286–303) uses Go 1.24's `os.OpenRoot` on line 291 to create a kernel-enforced filesystem root. Unlike simple path prefix checks, `os.Root` prevents symlink escapes at the kernel level — even if a symlink inside the workspace points to `/etc/passwd`, `os.Root` will refuse to follow it.\n\n`ReadFile` on lines 305–323 demonstrates the error handling: the code specifically catches `os.Root`'s \"escapes from parent\" error on line 314, treating it as an access denial. This means even if a symlink somehow gets created pointing outside the workspace, the read will fail cleanly rather than leaking data.\n\nWhile the deny-pattern system in the shell tool is a best-effort filter, the filesystem sandbox is a hard boundary backed by the Go runtime's OS integration. For remote research, this is the layer you can most confidently rely on — provided `restrict_to_workspace` stays set to `true` in your config."
+    },
+    {
+      "id": "chapter-10",
+      "label": "Secure Defaults",
+      "snippets": [
+        {
+          "filePath": "pkg/config/defaults.go",
+          "startLine": 26,
+          "endLine": 37,
+          "content": "\treturn &Config{\n\t\tAgents: AgentsConfig{\n\t\t\tDefaults: AgentDefaults{\n\t\t\t\tWorkspace:           workspacePath,\n\t\t\t\tRestrictToWorkspace: true,\n\t\t\t\tProvider:            \"\",\n\t\t\t\tModel:               \"\",\n\t\t\t\tMaxTokens:           32768,\n\t\t\t\tTemperature:         nil, // nil means use provider default\n\t\t\t\tMaxToolIterations:   50,\n\t\t\t},\n\t\t},"
+        },
+        {
+          "filePath": "pkg/config/defaults.go",
+          "startLine": 317,
+          "endLine": 320,
+          "content": "\t\tGateway: GatewayConfig{\n\t\t\tHost: \"127.0.0.1\",\n\t\t\tPort: 18790,\n\t\t},"
+        },
+        {
+          "filePath": "pkg/config/defaults.go",
+          "startLine": 348,
+          "endLine": 350,
+          "content": "\t\t\tExec: ExecConfig{\n\t\t\t\tEnableDenyPatterns: true,\n\t\t\t},"
+        }
+      ],
+      "explanation": "`DefaultConfig` establishes PicoClaw's out-of-the-box security posture. Line 30 sets `RestrictToWorkspace: true`, confining tools to `~/.picoclaw/workspace`, and line 35's `MaxToolIterations: 50` prevents runaway agent loops. Between these two snippets (lines 38–316), the config defines channel defaults and provider templates — all channels disabled by default.\n\nLines 317–320 bind the gateway to `127.0.0.1:18790` — localhost only, matching the launcher's default. Line 349's `EnableDenyPatterns: true` ensures the shell deny list is active. Together, these defaults mean a fresh PicoClaw install is reasonably locked down.\n\nThe catch is that these are *defaults*, not *enforced policies*. Every one of these settings can be overridden in `config.json`. For remote research, verify these values after deployment and consider making the config file read-only at the OS level."
+    },
+    {
+      "id": "chapter-11",
+      "label": "Docker Pitfalls",
+      "snippets": [
+        {
+          "filePath": "docker/Dockerfile",
+          "startLine": 32,
+          "endLine": 44,
+          "content": "# Create non-root user and group\nRUN addgroup -g 1000 picoclaw && \\\n    adduser -D -u 1000 -G picoclaw picoclaw\n\n# Switch to non-root user\nUSER picoclaw\n\n# Run onboard to create initial directories and config\nRUN /usr/local/bin/picoclaw onboard\n\nENTRYPOINT [\"picoclaw\"]\nCMD [\"gateway\"]"
+        },
+        {
+          "filePath": "docker/Dockerfile.full",
+          "startLine": 37,
+          "endLine": 44,
+          "content": "# Copy binary\nCOPY --from=builder /src/build/picoclaw /usr/local/bin/picoclaw\n\n# Create picoclaw home directory\nRUN /usr/local/bin/picoclaw onboard\n\nENTRYPOINT [\"picoclaw\"]\nCMD [\"gateway\"]"
+        }
+      ],
+      "explanation": "Two Dockerfiles tell different security stories. The standard `Dockerfile` (first snippet) takes security seriously: lines 33–34 create a dedicated `picoclaw` user and group with UID/GID 1000, and line 37 switches to that non-root user via the `USER` directive before the application runs.\n\nContrast this with `Dockerfile.full` (second snippet): it inherits from `node:24-alpine`, installs git, Python, and uv (not shown, lines 23–35 above), and has *no* `USER` directive. Lines 41–44 run `picoclaw onboard` and start the gateway — all as root. For personal research, you might reach for the full image because it supports MCP servers and Python tools. Be aware that any tool execution inside this container runs with full root privileges, negating much of the workspace sandboxing effort."
+    },
+    {
+      "id": "chapter-12",
+      "label": "Channel Auth",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/pico/pico.go",
+          "startLine": 232,
+          "endLine": 253,
+          "content": "func (c *PicoChannel) handleWebSocket(w http.ResponseWriter, r *http.Request) {\n\tif !c.IsRunning() {\n\t\thttp.Error(w, \"channel not running\", http.StatusServiceUnavailable)\n\t\treturn\n\t}\n\n\t// Authenticate\n\tif !c.authenticate(r) {\n\t\thttp.Error(w, \"unauthorized\", http.StatusUnauthorized)\n\t\treturn\n\t}\n\n\t// Check connection limit\n\tmaxConns := c.config.MaxConnections\n\tif maxConns <= 0 {\n\t\tmaxConns = 100\n\t}\n\tif int(c.connCount.Load()) >= maxConns {\n\t\thttp.Error(w, \"too many connections\", http.StatusServiceUnavailable)\n\t\treturn\n\t}"
+        },
+        {
+          "filePath": "pkg/channels/pico/pico.go",
+          "startLine": 287,
+          "endLine": 309,
+          "content": "func (c *PicoChannel) authenticate(r *http.Request) bool {\n\ttoken := c.config.Token\n\tif token == \"\" {\n\t\treturn false\n\t}\n\n\t// Check Authorization header\n\tauth := r.Header.Get(\"Authorization\")\n\tif after, ok := strings.CutPrefix(auth, \"Bearer \"); ok {\n\t\tif after == token {\n\t\t\treturn true\n\t\t}\n\t}\n\n\t// Check query parameter only when explicitly allowed\n\tif c.config.AllowTokenQuery {\n\t\tif r.URL.Query().Get(\"token\") == token {\n\t\t\treturn true\n\t\t}\n\t}\n\n\treturn false\n}"
+        }
+      ],
+      "explanation": "Every Pico WebSocket connection must pass through `handleWebSocket` (lines 232–253), which gates access via `c.authenticate(r)` on line 239 before upgrading the connection. The `authenticate` method (lines 287–309) checks for a Bearer token in the Authorization header on lines 294–299. Line 302 shows `AllowTokenQuery` — when enabled, the token can also be passed as a URL query parameter. This is convenient for browser-based testing but risky because URLs appear in server logs, browser history, and referrer headers.\n\nNote that `allow_from` filtering happens later, in `handleMessageSend` (not shown), where `c.IsAllowedSender` is called. An empty `allow_from` list means \"allow everyone,\" which is the default. If you're exposing the Pico channel on a remote instance, both a strong token *and* a restrictive `allow_from` list are essential."
+    },
+    {
+      "id": "chapter-13",
+      "label": "Security Summary",
+      "snippets": [],
+      "explanation": "PicoClaw's security story is one of pragmatic tradeoffs shaped by its origins as an embedded-device AI assistant. The strongest protection is the filesystem sandbox built on Go's `os.Root` — a kernel-level containment mechanism that genuinely prevents path traversal and symlink escapes. The shell command deny-pattern system, while impressively comprehensive with 40+ patterns, is a best-effort denylist that can be circumvented by novel command constructions or simply disabled via configuration.\n\nThe most significant gotcha for remote research is the launcher's complete lack of authentication. The config and auth APIs expose every secret in your deployment — API keys, OAuth tokens, bot credentials — to anyone who can reach the port. This single issue compounds with other risks: an attacker who can modify your config can disable deny patterns, change LLM providers, and alter workspace restrictions. If you use the launcher remotely, place it behind a reverse proxy with authentication, or better yet, configure PicoClaw manually via the JSON file and skip the launcher entirely.\n\nOther practical recommendations: always use the standard Dockerfile (not `Dockerfile.full`) to maintain non-root isolation, set explicit `allow_from` lists on any enabled channels, and be aware that OAuth flows use HTTP rather than HTTPS for redirect URIs. For personal research on a VPS you control, PicoClaw is safe enough — provided you treat network exposure as the threat it is and keep the default security settings intact."
+    }
+  ]
+}
