@@ -1,6 +1,12 @@
 {
   "stories": [
     {
+      "id": "pythea-strawberry-hallucination-detection",
+      "title": "How Strawberry Detects Hallucinations: From EDFL Theory to MCP Tools",
+      "commitHash": "ddf2cd2dea2d125b116b350c6a5f76f5c79b906b",
+      "createdAt": "2026-03-03T00:00:00.000Z"
+    },
+    {
       "id": "picoclaw-user-learning",
       "title": "How PicoClaw Learns from User Interactions",
       "commitHash": "4a7605ee14bff076ca77c8916c6bd59930224566",

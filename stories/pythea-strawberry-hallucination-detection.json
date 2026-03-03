@@ -1,0 +1,227 @@
+{
+  "id": "pythea-strawberry-hallucination-detection",
+  "title": "How Strawberry Detects Hallucinations: From EDFL Theory to MCP Tools",
+  "query": "How does the Strawberry toolkit work to detect and flag hallucinations? Explain the core detection mechanism, the EDFL theory, bits-to-trust metrics, ISR gating, and how the MCP server exposes hallucination detection as tools.",
+  "repo": "leochlon/pythea",
+  "commitHash": "ddf2cd2dea2d125b116b350c6a5f76f5c79b906b",
+  "createdAt": "2026-03-03T00:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "Overview",
+      "snippets": [],
+      "explanation": "Berry (also called \"Strawberry\") is a hallucination detection toolkit that brings information theory to verifying AI-generated claims. Rather than asking \"is this true?\" — a question no system can reliably answer — Berry asks a more tractable one: \"does the cited evidence provide enough information to justify this claim?\"\n\nThe system implements **EDFL** (Evidence-Derived Factual Likelihood): the core theory that a claim's trustworthiness can be measured by how much evidence shifts a verifier model's belief. Each claim is evaluated twice — once with its cited evidence visible, once with that evidence redacted — and the difference is quantified using KL divergence, expressed in **bits**. This \"bits-to-trust\" metric tells you exactly how much information the evidence contributes.\n\nThe critical gate is **ISR** (Information Sufficiency Requirement): if the bits required to reach the target confidence exceed the bits actually observed from the evidence, the claim is **flagged** as insufficiently supported. Berry exposes this detection capability through an **MCP** (Model Context Protocol) server, making it callable as tools by AI coding assistants like Cursor, Claude Code, or Codex. Let's walk through how it all works."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Data Model",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/core.py",
+          "startLine": 18,
+          "endLine": 39,
+          "content": "@dataclass\nclass Span:\n    sid: str\n    text: str\n\n\n@dataclass\nclass Step:\n    idx: int\n    claim: str\n    cites: List[str]\n    confidence: float\n\n\n@dataclass\nclass Trace:\n    steps: List[Step]\n    spans: List[Span]\n\n\ndef _to_bits(nats: float) -> float:\n    return float(nats) / _LN2"
+        }
+      ],
+      "explanation": "Three small dataclasses form the input contract for everything that follows. A `Span` (line 19) is a piece of evidence — a code excerpt, documentation snippet, or command output — identified by a string ID like `\"S0\"`. A `Step` (line 25) is a single verifiable claim: its text, a list of cited span IDs, and a confidence target. A `Trace` (line 33) bundles steps and spans into the complete verification context. The `_to_bits` helper on line 38 converts from nats to bits by dividing by ln(2) — a conversion that appears throughout the codebase because bits are more intuitive for humans: one bit is a single yes/no distinction."
+    },
+    {
+      "id": "chapter-2",
+      "label": "Claim Splitting",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/core.py",
+          "startLine": 70,
+          "endLine": 103,
+          "content": "def _split_claims(answer: str, mode: str, max_claims: int) -> List[str]:\n    a = (answer or \"\").strip()\n    if not a:\n        return []\n\n    if mode == \"lines\":\n        raw = [ln.strip() for ln in a.splitlines() if ln.strip()]\n    else:\n        raw = [s.strip() for s in _SENTENCE_SPLIT_RE.split(a) if s.strip()]\n\n    cite_prefix_re = re.compile(r\"^\\s*(?:\\[(?:[A-Za-z]\\w*|\\d+)\\]\\s*)+\")\n\n    merged: List[str] = []\n    for seg in raw:\n        # If a segment begins with citations and then continues with content,\n        # move the citation prefix back onto the previous claim.\n        if merged:\n            m = cite_prefix_re.match(seg)\n            if m:\n                prefix = seg[: m.end()].strip()\n                rest = seg[m.end() :].strip()\n                if prefix and rest:\n                    merged[-1] = (merged[-1] + \" \" + prefix).strip()\n                    seg = rest\n\n        remainder = _DEFAULT_CITE_RE.sub(\"\", seg)\n        remainder = re.sub(r\"[\\\\s,;:.\\\\-\\u2013\\u2014!?]+\", \"\", remainder)\n        cites_only = (remainder == \"\") and bool(_DEFAULT_CITE_RE.search(seg))\n        if cites_only and merged:\n            merged[-1] = (merged[-1] + \" \" + seg).strip()\n        else:\n            merged.append(seg)\n\n    return merged[: max(1, int(max_claims))]"
+        }
+      ],
+      "explanation": "Before verification can begin, an answer must be decomposed into individual claims. `_split_claims` (line 70) handles this by splitting on sentence boundaries using the regex `(?<=[.!?])\\s+`, or by lines if requested.\n\nThe interesting complexity starts at line 82 with the merging logic. When a sentence fragment consists entirely of citations like `[S1][S2]`, it gets folded back into the previous claim rather than standing alone as an empty claim (lines 98-99). Lines 86-93 handle an even subtler case: when a segment *begins* with citations followed by new content, those leading citations are moved back to the previous claim — because they're trailing references for the prior sentence that happened to land after a sentence break. This careful merging ensures each claim carries exactly the citations that reference it, which is critical because the downstream verification uses those citations to decide which evidence spans to check."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Entailment Prompt",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/trace_budget.py",
+          "startLine": 118,
+          "endLine": 145,
+          "content": "def build_yes_prompt(*, spans: Sequence[Any], claim: str) -> str:\n    ctx = _spans_block(spans, mask_nonassertive=True)\n    return f\"\"\"\nYou are a **strict textual entailment** verifier.\n\nDefinitions:\n- Only **declarative assertions** in the CONTEXT can entail facts.\n- **Questions, prompts, headings, and instructions do NOT assert facts** and do NOT entail their presuppositions.\n- Do **not** use world knowledge or plausibility; judge only whether the CLAIM follows from the asserted text.\n\nDecision rule:\n- Reply YES only if the CLAIM is explicitly stated or logically implied by at least one ASSERTION span.\n- Reply NO only if the CONTEXT explicitly contradicts the CLAIM.\n- Otherwise reply UNSURE (including when the CONTEXT contains only questions/instructions).\n\nCONTEXT SPANS:\n{ctx}\n\nCLAIM:\n{claim.strip()}\n\nQuestion: Is the CLAIM entailed by the CONTEXT?\n\nReply with EXACTLY one of these tokens (no punctuation, no extra text):\nYES\nNO\nUNSURE\n\"\"\".strip()"
+        }
+      ],
+      "explanation": "`build_yes_prompt` constructs the question the verifier LLM must answer. Lines 120-145 define a strict textual entailment test: given context spans, is the claim entailed? The verifier must reply with exactly one token — YES, NO, or UNSURE.\n\nThe subtlety is in the definitions section (lines 123-127). Questions and instructions in the context are explicitly called out as *not asserting facts* — a question like \"Is Python fast?\" does not entail that Python is fast. The verifier is told to ignore world knowledge and judge only from the asserted text. This prevents the verifier from using its own training data as a backdoor source of \"evidence,\" which would defeat the entire EDFL approach. The `_spans_block` helper (called on line 119) enforces this further by masking non-assertive spans as `[NON-EVIDENCE:QUESTION]`."
+    },
+    {
+      "id": "chapter-4",
+      "label": "Prior vs Post",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/trace_budget.py",
+          "startLine": 84,
+          "endLine": 100,
+          "content": "def scrub_spans_by_id(spans: Sequence[Any], cites: Sequence[str], *, placeholder: str = \"[REDACTED]\") -> List[Any]:\n    cset = {str(c) for c in cites}\n    out: List[Any] = []\n    for s in spans:\n        sid = str(getattr(s, \"sid\"))\n        text = str(getattr(s, \"text\"))\n        if sid in cset:\n            try:\n                out.append(type(s)(sid=sid, text=placeholder))\n            except Exception:\n                out.append({\"sid\": sid, \"text\": placeholder})\n        else:\n            try:\n                out.append(type(s)(sid=sid, text=text))\n            except Exception:\n                out.append({\"sid\": sid, \"text\": text})\n    return out"
+        }
+      ],
+      "explanation": "The mechanism that creates the null hypothesis for EDFL lives in `scrub_spans_by_id` (line 84). It takes a list of spans and a set of cited IDs, then replaces cited span text with `[REDACTED]` while preserving uncited spans intact (lines 90-99). The prior prompt uses this scrubbed version; the post prompt uses the real evidence.\n\nWhy redact rather than omit? Because document structure matters. A verifier seeing `[S0] [REDACTED]` still knows span S0 exists — preserving positional context and attention patterns. The only variable that changes is the information content, making the comparison scientifically cleaner."
+    },
+    {
+      "id": "chapter-5",
+      "label": "Logprob Extraction",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/stage_ab.py",
+          "startLine": 54,
+          "endLine": 110,
+          "content": "@dataclass\nclass TokenTopK:\n    \"\"\"Top-K distribution at the answer-start token position.\"\"\"\n\n    pos: int\n    generated_token: str\n    generated_logprob: float\n    topk_logprobs: Dict[str, float]\n    kth_logprob: Optional[float]\n\n\ndef extract_answer_topk(logprobs: Any) -> TokenTopK:\n    \"\"\"Extract a top-K distribution for the first non-whitespace output token.\"\"\"\n    if logprobs is None:\n        raise ValueError(\"logprobs is None; call the API with logprobs enabled\")\n\n    seq = list(logprobs)\n    if not seq:\n        raise ValueError(\"empty logprobs list\")\n\n    pos = 0\n    for i, tokinfo in enumerate(seq):\n        tok = _get_token(tokinfo)\n        if tok.strip() != \"\":\n            pos = i\n            break\n\n    tokinfo = seq[pos]\n    gen_tok = _get_token(tokinfo)\n    gen_lp = _get_logprob(tokinfo)\n    if gen_lp is None:\n        raise ValueError(\"missing logprob for generated token\")\n\n    top_list = _get_top_logprobs(tokinfo)\n    topk: Dict[str, float] = {}\n    for t in top_list:\n        tt = _get_token(t)\n        lp = _get_logprob(t)\n        if lp is None:\n            continue\n        key = tt.lstrip()\n        if key == \"\":\n            continue\n        topk[key] = max(topk.get(key, -math.inf), float(lp))\n\n    kth = None\n    if top_list:\n        lps = [lp for lp in ([_get_logprob(t) for t in top_list]) if lp is not None]\n        kth = min(lps) if lps else None\n\n    return TokenTopK(\n        pos=int(pos),\n        generated_token=str(gen_tok),\n        generated_logprob=float(gen_lp),\n        topk_logprobs=topk,\n        kth_logprob=kth,\n    )"
+        }
+      ],
+      "explanation": "The verifier's response is a stream of token probabilities, and `extract_answer_topk` (line 65) parses this into a structured `TokenTopK` object. Lines 74-79 skip leading whitespace tokens to find the first substantive token — the YES/NO/UNSURE answer.\n\nLines 88-97 aggregate the top-K logprob list into a dictionary, deduplicating by stripped token text and keeping the maximum logprob for each key. The loop at lines 100-102 finds the minimum logprob in the top-K list — this `kth_logprob` value becomes crucial later as a conservative upper bound on the probability of any token *not* in the top-K. The `TokenTopK` dataclass (lines 54-62) bundles everything together: the generated token, its logprob, the full top-K map, and the kth boundary."
+    },
+    {
+      "id": "chapter-6",
+      "label": "P(YES) Bounds",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/trace_budget.py",
+          "startLine": 182,
+          "endLine": 209,
+          "content": "def yesprob_from_logprobs(logprobs: Any) -> YesProb:\n    topk = extract_answer_topk(logprobs)\n    yes_lps = [\n        float(lp)\n        for tok, lp in (topk.topk_logprobs or {}).items()\n        if str(tok).strip().upper() == \"YES\"\n    ]\n\n    if yes_lps:\n        p = sum(math.exp(lp) for lp in yes_lps)\n        p = min(max(float(p), 0.0), 1.0)\n        p_lower = p\n        p_upper = p\n    else:\n        p_lower = 0.0\n        if topk.kth_logprob is not None and math.isfinite(float(topk.kth_logprob)):\n            p_upper = math.exp(float(topk.kth_logprob))\n        else:\n            p_upper = 1.0\n\n    return YesProb(\n        p_yes_lower=float(p_lower),\n        p_yes_upper=float(p_upper),\n        generated=str(topk.generated_token),\n        generated_logprob=float(topk.generated_logprob),\n        kth_logprob=float(topk.kth_logprob) if topk.kth_logprob is not None else None,\n        topk=dict(topk.topk_logprobs),\n    )"
+        }
+      ],
+      "explanation": "Converting raw top-K data into probability bounds is the job of `yesprob_from_logprobs` (line 182). When \"YES\" appears among the top-K tokens (lines 190-194), both bounds equal the summed probability — no uncertainty. But when \"YES\" is absent (lines 195-200), the lower bound is zero and the upper bound is `exp(kth_logprob)`, the probability of the K-th ranked token.\n\nThis interval arithmetic is essential. The verifier only returns its top-K most probable tokens, so if YES didn't make the cut, its probability is *at most* as large as the least likely token that did. These bounds propagate through all subsequent calculations, ensuring the final flagging decision honestly accounts for measurement uncertainty rather than pretending to have precision it lacks."
+    },
+    {
+      "id": "chapter-7",
+      "label": "Bits-to-Trust Math",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/trace_budget.py",
+          "startLine": 35,
+          "endLine": 42,
+          "content": "def _safe_clip(p: float, eps: float = 1e-12) -> float:\n    return min(max(float(p), eps), 1.0 - eps)\n\n\ndef kl_bernoulli(a: float, b: float) -> float:\n    a = _safe_clip(a)\n    b = _safe_clip(b)\n    return a * math.log(a / b) + (1 - a) * math.log((1 - a) / (1 - b))"
+        },
+        {
+          "filePath": "src/berry/hallucination_detector/trace_budget.py",
+          "startLine": 229,
+          "endLine": 247,
+          "content": "def _budget_from_intervals(\n    *,\n    target: float,\n    p0_lo: float,\n    p0_hi: float,\n    p1_lo: float,\n    p1_hi: float,\n) -> Tuple[float, float, float, float, float, float, bool]:\n    req_min = kl_bernoulli(target, p0_hi)\n    req_max = kl_bernoulli(target, max(p0_lo, 1e-12))\n\n    corners = [(p1_lo, p0_lo), (p1_lo, p0_hi), (p1_hi, p0_lo), (p1_hi, p0_hi)]\n    obs_vals = [kl_bernoulli(p1, p0) for (p1, p0) in corners]\n    obs_min, obs_max = float(min(obs_vals)), float(max(obs_vals))\n\n    gap_min = req_min - obs_max\n    gap_max = req_max - obs_min\n    flagged = (req_min > obs_max)\n    return req_min, req_max, obs_min, obs_max, gap_min, gap_max, flagged"
+        }
+      ],
+      "explanation": "At the mathematical heart of EDFL are two functions. `kl_bernoulli` (line 39) computes KL divergence between Bernoulli distributions: `a * log(a/b) + (1-a) * log((1-a)/(1-b))`. This measures how many nats of information separate one belief from another. The `_safe_clip` helper (line 35) prevents log(0) by clamping probabilities away from the boundaries.\n\n`_budget_from_intervals` (line 229) applies this to the detection problem with full interval arithmetic. **Required bits** (lines 237-238) is `KL(target || prior)` — how much information is needed to move from the prior belief to the target confidence. The higher the target (e.g. 0.95) and the lower the prior, the more bits are required. **Observed bits** (lines 240-242) is `KL(post || prior)` computed over all four corners of the probability uncertainty rectangle, giving worst-case and best-case estimates.\n\nThe ISR gate on line 246 is the decision rule: `flagged = (req_min > obs_max)`. A claim is flagged only when the *minimum* required information exceeds the *maximum* observed information — the most conservative possible test. If there's *any* interpretation of the uncertain probabilities under which the evidence suffices, the claim gets the benefit of the doubt."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Score Orchestration",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/trace_budget.py",
+          "startLine": 281,
+          "endLine": 324,
+          "content": "    for st in steps:\n        idx = int(getattr(st, \"idx\"))\n        claim = str(getattr(st, \"claim\"))\n        cites = [str(c) for c in getattr(st, \"cites\", [])]\n        target = float(getattr(st, \"confidence\", default_target) or default_target)\n        idxs.append(idx)\n        claims.append(claim)\n        cites_list.append(cites)\n        targets.append(target)\n\n        ctx_spans = _select_context_spans(spans=spans, cites=cites, mode=context_mode)\n        post_prompts.append(build_yes_prompt(spans=ctx_spans, claim=claim))\n\n        if cites:\n            null_spans = scrub_spans_by_id(ctx_spans, cites, placeholder=placeholder)\n        else:\n            null_spans = scrub_spans_by_id(ctx_spans, [getattr(s, \"sid\") for s in ctx_spans], placeholder=placeholder)\n\n        prior_prompts.append(build_yes_prompt(spans=null_spans, claim=claim))\n\n    post_results = backend.call_text_batch(\n        prompts=post_prompts,\n        model=verifier_model,\n        instructions=\"Reply with exactly one token: YES, NO, or UNSURE.\",\n        temperature=temperature,\n        max_output_tokens=5,\n        include_logprobs=True,\n        top_logprobs=int(top_logprobs),\n        reasoning=reasoning,\n    )\n\n    if hasattr(backend, \"reset_state\"):\n        backend.reset_state()\n\n    prior_results = backend.call_text_batch(\n        prompts=prior_prompts,\n        model=verifier_model,\n        instructions=\"Reply with exactly one token: YES, NO, or UNSURE.\",\n        temperature=temperature,\n        max_output_tokens=5,\n        include_logprobs=True,\n        top_logprobs=int(top_logprobs),\n        reasoning=reasoning,\n    )"
+        },
+        {
+          "filePath": "src/berry/hallucination_detector/trace_budget.py",
+          "startLine": 326,
+          "endLine": 357,
+          "content": "    out: List[BudgetResult] = []\n    for idx, claim, cites, target, post_tr, prior_tr in zip(idxs, claims, cites_list, targets, post_results, prior_results):\n        post_yes = yesprob_from_logprobs(post_tr.logprobs)\n        prior_yes = yesprob_from_logprobs(prior_tr.logprobs)\n\n        req_min, req_max, obs_min, obs_max, gap_min, gap_max, flagged = _budget_from_intervals(\n            target=target,\n            p0_lo=prior_yes.p_yes_lower,\n            p0_hi=prior_yes.p_yes_upper,\n            p1_lo=post_yes.p_yes_lower,\n            p1_hi=post_yes.p_yes_upper,\n        )\n\n        out.append(\n            BudgetResult(\n                idx=int(idx),\n                claim=str(claim),\n                cites=list(cites),\n                target=float(target),\n                prior_yes=prior_yes,\n                post_yes=post_yes,\n                required_bits_min=float(req_min),\n                required_bits_max=float(req_max),\n                observed_bits_min=float(obs_min),\n                observed_bits_max=float(obs_max),\n                budget_gap_min=float(gap_min),\n                budget_gap_max=float(gap_max),\n                flagged=bool(flagged),\n            )\n        )\n\n    return out"
+        }
+      ],
+      "explanation": "`score_trace_budget` ties together all the pieces built so far. The first snippet shows the prompt-building loop (lines 281-299): for each step, a post prompt is built from real evidence (line 292) and a prior prompt from scrubbed spans (line 299). When a step has no citations at all, line 297 redacts *every* span — creating a total null hypothesis.\n\nLines 301-310 dispatch post prompts as a batch, and lines 315-324 do the same for prior prompts. The backend handles parallelism internally via thread pools. Between the two batches, `reset_state()` on lines 312-313 triggers garbage collection to reclaim memory before the second round.\n\nThe result assembly loop in the second snippet (lines 327-355) pairs up prior and post results, extracts yes-probabilities via `yesprob_from_logprobs` (lines 328-329), runs `_budget_from_intervals` (lines 331-337), and packages everything into `BudgetResult` objects. Each result carries the full audit trail: both probability distributions, the required/observed intervals, and the flagged boolean — giving callers complete transparency into why a claim was or wasn't flagged."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Backend System",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/backends/base.py",
+          "startLine": 13,
+          "endLine": 44,
+          "content": "@dataclass\nclass BackendConfig:\n    kind: str = \"openai\"\n    max_concurrency: int = 20\n    timeout_s: Optional[float] = None\n    base_url: Optional[str] = None\n    api_key: Optional[str] = None\n\n\nclass OpenAIBackend:\n    \"\"\"Thin wrapper around openai backend with batch helpers (thread-pool parallelism).\"\"\"\n\n    def __init__(self, cfg: BackendConfig):\n        self.cfg = cfg\n\n    def call_text(self, **kwargs: Any) -> TextResult:\n        return call_text_chat(\n            **kwargs,\n            timeout_s=self.cfg.timeout_s,\n            base_url=self.cfg.base_url,\n            api_key=self.cfg.api_key,\n        )\n\n    def call_text_batch(self, *, prompts: Sequence[str], **kwargs: Any) -> List[TextResult]:\n        max_workers = max(1, int(self.cfg.max_concurrency))\n        with cf.ThreadPoolExecutor(max_workers=max_workers) as ex:\n            futs = [ex.submit(self.call_text, prompt=p, **kwargs) for p in prompts]\n            return [f.result() for f in futs]\n\n    def reset_state(self) -> None:\n        import gc\n        gc.collect()"
+        },
+        {
+          "filePath": "src/berry/hallucination_detector/backends/base.py",
+          "startLine": 97,
+          "endLine": 107,
+          "content": "def make_backend(cfg: BackendConfig):\n    kind = (cfg.kind or \"openai\").lower().strip()\n    if kind == \"openai\":\n        return OpenAIBackend(cfg)\n    if kind == \"gemini\":\n        return GeminiBackend(cfg)\n    if kind == \"vertex\":\n        return VertexBackend(cfg)\n    if kind == \"dummy\":\n        return DummyBackend()\n    raise ValueError(f\"Unknown backend kind: {cfg.kind!r}\")"
+        }
+      ],
+      "explanation": "A clean factory pattern lets Berry support multiple verification providers. `BackendConfig` (line 14) captures the selection — `kind`, `max_concurrency`, and optional connection parameters. The `OpenAIBackend` (line 22) wraps the OpenAI chat API, with `call_text_batch` (lines 36-40) fanning prompts across a `ThreadPoolExecutor` for parallelism.\n\nThe factory function `make_backend` (line 97) maps a config kind string to the right class — OpenAI, Gemini, Vertex, or a deterministic `DummyBackend` for tests. All backends share the same interface: `call_text`, `call_text_batch`, and `reset_state`. This uniformity means swapping verification providers — from OpenAI to Gemini, for example — is a one-line environment variable change."
+    },
+    {
+      "id": "chapter-10",
+      "label": "OpenAI Backend",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/backends/openai_backend.py",
+          "startLine": 51,
+          "endLine": 97,
+          "content": "@dataclass\nclass TextResult:\n    text: str\n    response_id: Optional[str] = None\n    logprobs: Optional[Any] = None\n\n\ndef call_text_chat(\n    *,\n    prompt: str,\n    model: str = \"gpt-4o-mini\",\n    instructions: str = \"You are a helpful assistant.\",\n    temperature: float = 0.0,\n    max_output_tokens: int = 64,\n    include_logprobs: bool = False,\n    top_logprobs: int = 0,\n    retries: int = 3,\n    retry_backoff_s: float = 1.5,\n    timeout_s: Optional[float] = None,\n    base_url: Optional[str] = None,\n    api_key: Optional[str] = None,\n    **_kwargs: Any,  # ignore extra args like 'reasoning'\n) -> TextResult:\n    \"\"\"Call an OpenAI model using the Chat Completions API (supports logprobs).\"\"\"\n    client = _get_client(timeout_s=timeout_s, base_url=base_url, api_key=api_key)\n\n    if top_logprobs < 0 or top_logprobs > 20:\n        raise ValueError(\"top_logprobs must be between 0 and 20\")\n\n    last_err: Optional[Exception] = None\n    for attempt in range(retries + 1):\n        try:\n            api_kwargs: Dict[str, Any] = {}\n            if include_logprobs:\n                api_kwargs[\"logprobs\"] = True\n                api_kwargs[\"top_logprobs\"] = int(top_logprobs)\n\n            resp = client.chat.completions.create(\n                model=model,\n                messages=[\n                    {\"role\": \"system\", \"content\": instructions},\n                    {\"role\": \"user\", \"content\": prompt},\n                ],\n                temperature=float(temperature),\n                max_tokens=int(max_output_tokens),\n                **api_kwargs,\n            )"
+        },
+        {
+          "filePath": "src/berry/hallucination_detector/backends/openai_backend.py",
+          "startLine": 99,
+          "endLine": 117,
+          "content": "            choice = resp.choices[0]\n            out_text = choice.message.content or \"\"\n\n            out_logprobs = None\n            if include_logprobs and getattr(choice, \"logprobs\", None) and getattr(choice.logprobs, \"content\", None):\n                out_logprobs = []\n                for token_info in choice.logprobs.content:\n                    token_data = {\n                        \"token\": token_info.token,\n                        \"logprob\": token_info.logprob,\n                    }\n                    if token_info.top_logprobs:\n                        token_data[\"top_logprobs\"] = [\n                            {\"token\": t.token, \"logprob\": t.logprob}\n                            for t in token_info.top_logprobs\n                        ]\n                    out_logprobs.append(token_data)\n\n            return TextResult(text=str(out_text), response_id=getattr(resp, \"id\", None), logprobs=out_logprobs)"
+        }
+      ],
+      "explanation": "Every backend call returns a `TextResult` (line 51): the generated text, an optional response ID, and the logprobs that make the entire detection system work. Without logprobs, there would be no probabilities to measure.\n\n`call_text_chat` (line 58) builds the API request: a system message plus the user prompt, with `logprobs: true` and `top_logprobs` set to request the full top-K distribution (lines 83-86). The chat completion is created on lines 88-97. In the second snippet, lines 99-100 extract the generated text, and lines 103-115 parse the logprob structure — walking through each token's top alternatives and packaging them into the lightweight dict format the pipeline consumes. Line 117 returns the `TextResult`, passing along the raw logprobs that will eventually flow through `extract_answer_topk` and `yesprob_from_logprobs` upstream."
+    },
+    {
+      "id": "chapter-11",
+      "label": "Detection API",
+      "snippets": [
+        {
+          "filePath": "src/berry/hallucination_detector/core.py",
+          "startLine": 178,
+          "endLine": 199,
+          "content": "def run_detect_hallucination(\n    *,\n    answer: str,\n    spans: List[Dict[str, str]],\n    verifier_model: str = \"gpt-4o-mini\",\n    default_target: float = 0.95,\n    placeholder: str = \"[REDACTED]\",\n    max_claims: int = 25,\n    claim_split: str = \"sentences\",\n    citation_regex: Optional[str] = None,\n    temperature: float = 0.0,\n    top_logprobs: int = 10,\n    max_concurrency: int = 8,\n    timeout_s: Optional[float] = 30.0,\n    units: str = \"bits\",\n    context_mode: str = \"all\",\n    require_citations: bool = False,\n    include_prompts: bool = False,\n    max_prompt_chars: int = 3000,\n    pool_json_path: Optional[str] = None,\n    local_llm_model_path: Optional[str] = None,\n) -> Dict[str, Any]:"
+        },
+        {
+          "filePath": "src/berry/hallucination_detector/core.py",
+          "startLine": 212,
+          "endLine": 246,
+          "content": "    cite_re = re.compile(citation_regex) if citation_regex else _DEFAULT_CITE_RE\n    known_ids = {s.sid for s in span_objs}\n    claims = _split_claims(answer, mode=claim_split, max_claims=max_claims)\n\n    steps: List[Step] = []\n    for i, cl in enumerate(claims):\n        cites = _extract_cites(cl, cite_re=cite_re)\n        cites = _map_cites_to_known_ids(cites, known=known_ids)\n        steps.append(Step(idx=i, claim=cl, cites=cites, confidence=float(default_target)))\n\n    trace = Trace(steps=steps, spans=span_objs)\n\n    prompts = None\n    if include_prompts:\n        prompts = build_trace_budget_prompts(\n            trace=trace,\n            placeholder=str(placeholder),\n            context_mode=str(context_mode),\n        )\n\n    backend_kind = (os.environ.get(\"BERRY_VERIFIER_BACKEND\") or \"openai\").strip().lower()\n    cfg = BackendConfig(kind=backend_kind, max_concurrency=int(max_concurrency), timeout_s=timeout_s)\n    results = score_trace_budget(\n        trace=trace,\n        verifier_model=verifier_model,\n        backend_cfg=cfg,\n        default_target=float(default_target),\n        temperature=float(temperature),\n        top_logprobs=int(top_logprobs),\n        placeholder=str(placeholder),\n        context_mode=str(context_mode),\n        reasoning=None,\n    )\n\n    details = [_format_result(r, units) for r in results]"
+        }
+      ],
+      "explanation": "The top-level entry point `run_detect_hallucination` (line 178) orchestrates the complete pipeline. Its signature exposes every tuning knob: the verifier model, target confidence, claim splitting strategy, citation regex, and output units. Between these two snippets, lines 200-211 handle early-exit error cases (no spans, unsupported backends) which we can skip over.\n\nThe second snippet shows the core flow. Lines 212-213 compile the citation regex and collect known span IDs. Line 214 splits the answer into claims. The loop at lines 216-220 pairs each claim with its extracted citations, maps them to known span IDs, and builds `Step` objects. Line 222 assembles the `Trace`, and lines 232-244 select the backend and invoke `score_trace_budget`. The result on line 246 formats each `BudgetResult` into the final output dictionary."
+    },
+    {
+      "id": "chapter-12",
+      "label": "MCP Server Tools",
+      "snippets": [
+        {
+          "filePath": "src/berry/mcp_server.py",
+          "startLine": 162,
+          "endLine": 168,
+          "content": "def create_server(*, project_root: Optional[Path], host: str = \"127.0.0.1\", port: int = 8000) -> Any:\n    try:\n        from mcp.server.fastmcp import FastMCP\n    except ImportError as exc:  # pragma: no cover\n        raise ImportError(\"MCP SDK not installed. Run: pip install 'mcp[cli]'\") from exc\n\n    mcp = FastMCP(\"berry\", json_response=True, host=host, port=port)"
+        },
+        {
+          "filePath": "src/berry/mcp_server.py",
+          "startLine": 423,
+          "endLine": 481,
+          "content": "    def _default_verifier_model() -> str:\n        return (\n            (os.environ.get(\"BERRY_VERIFIER_MODEL\") or \"\").strip()\n            or (os.environ.get(\"BERRY_MODEL\") or \"\").strip()\n            or \"gpt-4o-mini\"\n        )\n\n    @mcp.tool()\n    def detect_hallucination(\n        answer: str,\n        spans: List[Dict[str, str]],\n        verifier_model: Optional[str] = None,\n        default_target: float = 0.95,\n        max_claims: int = 25,\n        require_citations: bool = False,\n        context_mode: str = \"cited\",\n        timeout_s: float = 60.0,\n    ) -> Dict[str, Any]:\n        \"\"\"Information-budget diagnostic per claim.\"\"\"\n        with _redirect_stdout_to_stderr():\n            try:\n                return run_detect_hallucination(\n                    answer=str(answer or \"\"),\n                    spans=list(spans or []),\n                    verifier_model=str(verifier_model or _default_verifier_model()),\n                    default_target=float(default_target or 0.95),\n                    max_claims=int(max_claims or 25),\n                    require_citations=bool(require_citations),\n                    context_mode=str(context_mode or \"cited\"),\n                    timeout_s=float(timeout_s or 60.0),\n                )\n            except Exception as e:\n                return {\"flagged\": True, \"under_budget\": True, \"error\": str(e), \"details\": []}\n\n    @mcp.tool()\n    def audit_trace_budget(\n        steps: List[Dict[str, Any]],\n        spans: List[Dict[str, str]],\n        verifier_model: Optional[str] = None,\n        default_target: float = 0.95,\n        require_citations: bool = False,\n        context_mode: str = \"cited\",\n        timeout_s: float = 60.0,\n    ) -> Dict[str, Any]:\n        \"\"\"Score explicit (claim, cites) steps.\"\"\"\n        with _redirect_stdout_to_stderr():\n            try:\n                return run_audit_trace_budget(\n                    steps=list(steps or []),\n                    spans=list(spans or []),\n                    verifier_model=str(verifier_model or _default_verifier_model()),\n                    default_target=float(default_target or 0.95),\n                    require_citations=bool(require_citations),\n                    context_mode=str(context_mode or \"cited\"),\n                    timeout_s=float(timeout_s or 60.0),\n                )\n            except Exception as e:\n                return {\"flagged\": True, \"under_budget\": True, \"error\": str(e), \"details\": []}"
+        }
+      ],
+      "explanation": "Berry's MCP surface starts with `create_server` (line 162), which initializes a FastMCP instance. The `json_response=True` flag on line 168 ensures all tool outputs are JSON-serializable — critical for the MCP protocol.\n\nThe verification tools are registered inside the server closure, giving them access to the shared config. `_default_verifier_model` (line 423) resolves the model from environment variables, falling back to `gpt-4o-mini`. The `detect_hallucination` tool (line 430) and `audit_trace_budget` tool (line 457) are thin wrappers around the core Python API, delegating to `run_detect_hallucination` and `run_audit_trace_budget` respectively. The `_redirect_stdout_to_stderr` context manager on line 442 is essential for stdio transport — any stray print would corrupt the JSON-RPC stream. On failure, both tools return `{\"flagged\": True, \"error\": ...}` rather than throwing, ensuring the MCP client always receives a parseable result."
+    },
+    {
+      "id": "chapter-13",
+      "label": "Workflow Prompts",
+      "snippets": [
+        {
+          "filePath": "src/berry/prompts.py",
+          "startLine": 24,
+          "endLine": 59,
+          "content": "    Prompt(\n        name=\"search_and_learn_verified\",\n        title=\"Search & Learn (verified)\",\n        description=\"Answer questions about unfamiliar code/APIs with evidence + automatic hallucination checks.\",\n        template=(\n            \"You are in **Search & Learn** mode (Stack Overflow replacement).\\n\"\n            \"Your job is to answer the user's question using **evidence**, not vibes.\\n\"\n            \"\\n\"\n            \"## Evidence rules (non-negotiable)\\n\"\n            \"- You must build/use an **Evidence pack** of spans `S0`, `S1`, ... (repo excerpts, web excerpts, experiment output).\\n\"\n            \"- Every factual sentence in the answer must end with citations like `[S0]` or `[S1][S2]`.\\n\"\n            \"- If you cannot cite, label it explicitly as **Unknown** or **Assumption** (do NOT present it as fact).\\n\"\n            \"\\n\"\n            \"## Verification step\\n\"\n            \"After drafting the answer, call:\\n\"\n            \"- `audit_trace_budget(steps=..., spans=..., require_citations=true, context_mode='cited')` (use a short trace of key claims)\\n\"\n            \"If verification flags anything, gather more evidence to close the gap and re-run verification.\\n\"\n            \"If `audit_trace_budget` is run 3 times in a row, STOP and return only the claims that passed plus the claims that flagged and why they flagged.\\n\"\n            \"Otherwise return only the claims that pass.\\n\"\n            \"\\n\"\n            \"## Output format\\n\"\n            \"### Problem / question\\n\"\n            \"- What are we trying to learn?\\n\"\n            \"\\n\"\n            \"### Evidence pack\\n\"\n            \"> List `S0`, `S1`, ... and what each span represents.\\n\"\n            \"\\n\"\n            \"### Answer (cited)\\n\"\n            \"- Keep sentences short. One claim per sentence.\\n\"\n            \"\\n\"\n            \"### Verification\\n\"\n            \"- Paste the verifier summary + any flagged claims.\\n\"\n            \"\\n\"\n            \"### Gaps / next evidence to collect\\n\"\n            \"- If anything is Unknown/Assumption, say exactly what would confirm it (file path to inspect, command to run, URL to fetch).\\n\"\n        ),\n    ),"
+        }
+      ],
+      "explanation": "How does an AI agent know to use these verification tools? The `search_and_learn_verified` prompt (line 24) teaches the pattern: build an evidence pack of spans, cite every factual sentence, then call `audit_trace_budget` to verify.\n\nLines 37-41 define the verification step and include a critical safety valve — if the verifier runs 3 times consecutively, the agent must stop and report results. This prevents infinite retry loops. The output format enforces transparency: Evidence pack, Answer (cited), Verification results, and Gaps — making it clear where each claim's support comes from."
+    },
+    {
+      "id": "chapter-14",
+      "label": "Summary",
+      "snippets": [],
+      "explanation": "Berry's hallucination detection works by treating evidence sufficiency as a measurable, information-theoretic quantity. The pipeline starts with claims and evidence spans, constructs a pair of entailment prompts — one with real evidence, one with that evidence redacted — and uses the verifier LLM's token logprobs to measure the information gain. KL divergence between Bernoulli distributions gives the bits-to-trust metric, and the ISR gate flags claims where required bits exceed observed bits.\n\nSeveral design choices make this system robust. Interval arithmetic on P(YES) bounds handles the inherent uncertainty of top-K logprob data honestly. Redacting rather than omitting spans preserves document structure for a fair prior/post comparison. The strict entailment prompt masks questions and instructions as non-evidence, preventing the verifier from confusing context with assertion. And the pluggable backend abstraction lets teams swap between OpenAI, Gemini, and Vertex without touching the detection logic.\n\nThe MCP server closes the loop by exposing two tools — `detect_hallucination` for answers with inline citations, and `audit_trace_budget` for pre-structured claim traces. Workflow prompts teach AI agents the evidence-cite-verify-iterate pattern. The result is a system that doesn't try to judge truth directly, but instead measures whether the evidence *justifies* the confidence — a more tractable and more honest question."
+    }
+  ]
+}
