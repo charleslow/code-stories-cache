@@ -1,0 +1,240 @@
+{
+  "id": "fb8451d3-1df3-4284-a584-7b2386ef0ef6",
+  "title": "Picoclaw's Native Telegram Integration: From Factory Registration to Persistent Polling",
+  "query": "Does picoclaw support telegram integration? If yes, explain how. If no, how do we build a telegram sidecar and ensure persistent connection?",
+  "repo": "sipeed/picoclaw",
+  "commitHash": "435223f500b56b81c2c238c36109401ef5f1ba99",
+  "createdAt": "2026-03-03T12:00:00Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "The Big Picture",
+      "snippets": [],
+      "explanation": "The short answer is **yes** — picoclaw has built-in, first-class Telegram support. No sidecar process, no external bridge, no plugin installation. Telegram is one of over a dozen *channels* that picoclaw can connect to simultaneously.\n\nThe architecture revolves around a few key concepts. A **channel** is a platform adapter (Telegram, Discord, Slack, etc.) that translates platform-specific messages into a uniform internal format. The **MessageBus** is a set of buffered Go channels that decouple inbound messages (from users) from outbound messages (from the AI agent). The **Manager** orchestrates channel lifecycles, dispatches messages, handles rate limiting, and manages a pre-send pipeline for typing indicators and placeholder messages. Each channel implementation embeds a **BaseChannel** for shared logic like allowlists and group filtering, then adds platform-specific behavior.\n\nThe Telegram channel maintains a **persistent connection** via long polling — no public URL or webhook setup required. Let's trace exactly how this works, from registration to reply delivery."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Plugging In",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/telegram/init.go",
+          "startLine": 1,
+          "endLine": 13,
+          "content": "package telegram\n\nimport (\n\t\"github.com/sipeed/picoclaw/pkg/bus\"\n\t\"github.com/sipeed/picoclaw/pkg/channels\"\n\t\"github.com/sipeed/picoclaw/pkg/config\"\n)\n\nfunc init() {\n\tchannels.RegisterFactory(\"telegram\", func(cfg *config.Config, b *bus.MessageBus) (channels.Channel, error) {\n\t\treturn NewTelegramChannel(cfg, b)\n\t})\n}"
+        },
+        {
+          "filePath": "pkg/channels/registry.go",
+          "startLine": 1,
+          "endLine": 32,
+          "content": "package channels\n\nimport (\n\t\"sync\"\n\n\t\"github.com/sipeed/picoclaw/pkg/bus\"\n\t\"github.com/sipeed/picoclaw/pkg/config\"\n)\n\n// ChannelFactory is a constructor function that creates a Channel from config and message bus.\n// Each channel subpackage registers one or more factories via init().\ntype ChannelFactory func(cfg *config.Config, bus *bus.MessageBus) (Channel, error)\n\nvar (\n\tfactoriesMu sync.RWMutex\n\tfactories   = map[string]ChannelFactory{}\n)\n\n// RegisterFactory registers a named channel factory. Called from subpackage init() functions.\nfunc RegisterFactory(name string, f ChannelFactory) {\n\tfactoriesMu.Lock()\n\tdefer factoriesMu.Unlock()\n\tfactories[name] = f\n}\n\n// getFactory looks up a channel factory by name.\nfunc getFactory(name string) (ChannelFactory, bool) {\n\tfactoriesMu.RLock()\n\tdefer factoriesMu.RUnlock()\n\tf, ok := factories[name]\n\treturn f, ok\n}"
+        }
+      ],
+      "explanation": "Every channel in picoclaw registers itself through a factory pattern that eliminates hard-coded dependencies. In `init.go` (line 10), the Telegram package calls `channels.RegisterFactory(\"telegram\", ...)`, passing a constructor that creates a `TelegramChannel`. This runs at program startup thanks to Go's `init()` mechanism — simply importing the package is enough.\n\nThe registry in `registry.go` is equally clean: a mutex-protected map of `string → ChannelFactory` functions (lines 14-17). `RegisterFactory` writes to it, `getFactory` reads from it. The Manager never imports `telegram` directly — it just looks up `\"telegram\"` in the map. This means adding a new channel requires zero changes to the Manager. The pattern scales: Discord, Slack, WhatsApp, and many others each have their own `init.go` doing the exact same thing."
+    },
+    {
+      "id": "chapter-2",
+      "label": "Configuration",
+      "snippets": [
+        {
+          "filePath": "pkg/config/config.go",
+          "startLine": 237,
+          "endLine": 246,
+          "content": "type TelegramConfig struct {\n\tEnabled            bool                `json:\"enabled\"                 env:\"PICOCLAW_CHANNELS_TELEGRAM_ENABLED\"`\n\tToken              string              `json:\"token\"                   env:\"PICOCLAW_CHANNELS_TELEGRAM_TOKEN\"`\n\tProxy              string              `json:\"proxy\"                   env:\"PICOCLAW_CHANNELS_TELEGRAM_PROXY\"`\n\tAllowFrom          FlexibleStringSlice `json:\"allow_from\"              env:\"PICOCLAW_CHANNELS_TELEGRAM_ALLOW_FROM\"`\n\tGroupTrigger       GroupTriggerConfig  `json:\"group_trigger,omitempty\"`\n\tTyping             TypingConfig        `json:\"typing,omitempty\"`\n\tPlaceholder        PlaceholderConfig   `json:\"placeholder,omitempty\"`\n\tReasoningChannelID string              `json:\"reasoning_channel_id\"    env:\"PICOCLAW_CHANNELS_TELEGRAM_REASONING_CHANNEL_ID\"`\n}"
+        },
+        {
+          "filePath": "config/config.example.json",
+          "startLine": 49,
+          "endLine": 57,
+          "content": "    \"telegram\": {\n      \"enabled\": false,\n      \"token\": \"YOUR_TELEGRAM_BOT_TOKEN\",\n      \"proxy\": \"\",\n      \"allow_from\": [\n        \"YOUR_USER_ID\"\n      ],\n      \"reasoning_channel_id\": \"\"\n    },"
+        }
+      ],
+      "explanation": "`TelegramConfig` (lines 237-246) is a compact struct with environment variable overrides for every field — notice the `env:` tags. The `Token` is the BotFather-issued API token, `Proxy` supports SOCKS5/HTTP proxies for restricted networks, and `AllowFrom` is a `FlexibleStringSlice` that accepts both string and numeric user IDs.\n\nThe example config (lines 49-57) shows the minimal setup: set `enabled` to `true`, paste your bot token, and add your Telegram user ID to `allow_from`. Three fields to get a working Telegram bot."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Building the Bot",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/telegram/telegram.go",
+          "startLine": 41,
+          "endLine": 97,
+          "content": "type TelegramChannel struct {\n\t*channels.BaseChannel\n\tbot      *telego.Bot\n\tbh       *th.BotHandler\n\tcommands TelegramCommander\n\tconfig   *config.Config\n\tchatIDs  map[string]int64\n\tctx      context.Context\n\tcancel   context.CancelFunc\n}\n\nfunc NewTelegramChannel(cfg *config.Config, bus *bus.MessageBus) (*TelegramChannel, error) {\n\tvar opts []telego.BotOption\n\ttelegramCfg := cfg.Channels.Telegram\n\n\tif telegramCfg.Proxy != \"\" {\n\t\tproxyURL, parseErr := url.Parse(telegramCfg.Proxy)\n\t\tif parseErr != nil {\n\t\t\treturn nil, fmt.Errorf(\"invalid proxy URL %q: %w\", telegramCfg.Proxy, parseErr)\n\t\t}\n\t\topts = append(opts, telego.WithHTTPClient(&http.Client{\n\t\t\tTransport: &http.Transport{\n\t\t\t\tProxy: http.ProxyURL(proxyURL),\n\t\t\t},\n\t\t}))\n\t} else if os.Getenv(\"HTTP_PROXY\") != \"\" || os.Getenv(\"HTTPS_PROXY\") != \"\" {\n\t\t// Use environment proxy if configured\n\t\topts = append(opts, telego.WithHTTPClient(&http.Client{\n\t\t\tTransport: &http.Transport{\n\t\t\t\tProxy: http.ProxyFromEnvironment,\n\t\t\t},\n\t\t}))\n\t}\n\n\tbot, err := telego.NewBot(telegramCfg.Token, opts...)\n\tif err != nil {\n\t\treturn nil, fmt.Errorf(\"failed to create telegram bot: %w\", err)\n\t}\n\n\tbase := channels.NewBaseChannel(\n\t\t\"telegram\",\n\t\ttelegramCfg,\n\t\tbus,\n\t\ttelegramCfg.AllowFrom,\n\t\tchannels.WithMaxMessageLength(4096),\n\t\tchannels.WithGroupTrigger(telegramCfg.GroupTrigger),\n\t\tchannels.WithReasoningChannelID(telegramCfg.ReasoningChannelID),\n\t)\n\n\treturn &TelegramChannel{\n\t\tBaseChannel: base,\n\t\tcommands:    NewTelegramCommands(bot, cfg),\n\t\tbot:         bot,\n\t\tconfig:      cfg,\n\t\tchatIDs:     make(map[string]int64),\n\t}, nil\n}"
+        }
+      ],
+      "explanation": "Three steps define how picoclaw constructs a Telegram channel. First, lines 56-73 handle proxy configuration with a nice fallback chain: explicit config proxy → environment variables → no proxy. Second, line 75 creates the `telego.Bot` instance with the token and any proxy options. Third, lines 80-88 construct a `BaseChannel` using the functional options pattern — `WithMaxMessageLength(4096)` tells the Manager to auto-split long messages at Telegram's limit, `WithGroupTrigger` wires up group chat filtering, and `WithReasoningChannelID` optionally routes chain-of-thought to a separate chat.\n\nThe struct itself (lines 41-50) reveals the composition: `*channels.BaseChannel` is embedded for shared behavior, while `bot`, `bh` (BotHandler), `commands`, and `chatIDs` are Telegram-specific. The `ctx` and `cancel` fields manage the channel's lifecycle context — a pattern we'll see used in `Start()`."
+    },
+    {
+      "id": "chapter-4",
+      "label": "Long Polling",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/telegram/telegram.go",
+          "startLine": 99,
+          "endLine": 158,
+          "content": "func (c *TelegramChannel) Start(ctx context.Context) error {\n\tlogger.InfoC(\"telegram\", \"Starting Telegram bot (polling mode)...\")\n\n\tc.ctx, c.cancel = context.WithCancel(ctx)\n\n\tif err := c.initBotCommands(c.ctx); err != nil {\n\t\tlogger.WarnCF(\"telegram\", \"Failed to initialize bot commands\", map[string]any{\n\t\t\t\"error\": err.Error(),\n\t\t})\n\t}\n\n\tupdates, err := c.bot.UpdatesViaLongPolling(c.ctx, &telego.GetUpdatesParams{\n\t\tTimeout: 30,\n\t})\n\tif err != nil {\n\t\tc.cancel()\n\t\treturn fmt.Errorf(\"failed to start long polling: %w\", err)\n\t}\n\n\tbh, err := th.NewBotHandler(c.bot, updates)\n\tif err != nil {\n\t\tc.cancel()\n\t\treturn fmt.Errorf(\"failed to create bot handler: %w\", err)\n\t}\n\tc.bh = bh\n\n\tbh.HandleMessage(func(ctx *th.Context, message telego.Message) error {\n\t\treturn c.commands.Start(ctx, message)\n\t}, th.CommandEqual(\"start\"))\n\tbh.HandleMessage(func(ctx *th.Context, message telego.Message) error {\n\t\treturn c.commands.Help(ctx, message)\n\t}, th.CommandEqual(\"help\"))\n\n\tbh.HandleMessage(func(ctx *th.Context, message telego.Message) error {\n\t\treturn c.commands.Show(ctx, message)\n\t}, th.CommandEqual(\"show\"))\n\n\tbh.HandleMessage(func(ctx *th.Context, message telego.Message) error {\n\t\treturn c.commands.List(ctx, message)\n\t}, th.CommandEqual(\"list\"))\n\n\tbh.HandleMessage(func(ctx *th.Context, message telego.Message) error {\n\t\treturn c.handleMessage(ctx, &message)\n\t}, th.AnyMessage())\n\n\tc.SetRunning(true)\n\tlogger.InfoCF(\"telegram\", \"Telegram bot connected\", map[string]any{\n\t\t\"username\": c.bot.Username(),\n\t})\n\n\tgo func() {\n\t\tif err = bh.Start(); err != nil {\n\t\t\tlogger.ErrorCF(\"telegram\", \"Bot handler failed\", map[string]any{\n\t\t\t\t\"error\": err.Error(),\n\t\t\t})\n\t\t}\n\t}()\n\n\treturn nil\n}"
+        }
+      ],
+      "explanation": "`Start()` is where the persistent connection to Telegram is established. Line 110 is the key call: `bot.UpdatesViaLongPolling(ctx, &telego.GetUpdatesParams{Timeout: 30})`. This opens an HTTP connection to Telegram's servers that blocks for up to 30 seconds waiting for new messages. When one arrives (or the timeout expires), it returns immediately and reconnects. The 30-second timeout is Telegram's maximum — it minimizes HTTP overhead while keeping latency under a second for new messages.\n\nWhy long polling instead of webhooks? Picoclaw is designed as a *personal* AI agent, often running on a laptop, Raspberry Pi, or behind NAT. Webhooks require a publicly reachable URL with TLS — a significant setup burden. Long polling just works, anywhere, with no firewall configuration.\n\nLines 125-142 register message handlers on the `BotHandler`: specific commands (`/start`, `/help`, `/show`, `/list`) get their own handlers, and `th.AnyMessage()` catches everything else and routes it to `handleMessage`. Line 149 launches the handler in a goroutine — the `Start()` method returns immediately so the Manager can start other channels concurrently."
+    },
+    {
+      "id": "chapter-5",
+      "label": "Receiving Messages",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/telegram/telegram.go",
+          "startLine": 405,
+          "endLine": 454,
+          "content": "func (c *TelegramChannel) handleMessage(ctx context.Context, message *telego.Message) error {\n\tif message == nil {\n\t\treturn fmt.Errorf(\"message is nil\")\n\t}\n\n\tuser := message.From\n\tif user == nil {\n\t\treturn fmt.Errorf(\"message sender (user) is nil\")\n\t}\n\n\tplatformID := fmt.Sprintf(\"%d\", user.ID)\n\tsender := bus.SenderInfo{\n\t\tPlatform:    \"telegram\",\n\t\tPlatformID:  platformID,\n\t\tCanonicalID: identity.BuildCanonicalID(\"telegram\", platformID),\n\t\tUsername:    user.Username,\n\t\tDisplayName: user.FirstName,\n\t}\n\n\t// check allowlist to avoid downloading attachments for rejected users\n\tif !c.IsAllowedSender(sender) {\n\t\tlogger.DebugCF(\"telegram\", \"Message rejected by allowlist\", map[string]any{\n\t\t\t\"user_id\": platformID,\n\t\t})\n\t\treturn nil\n\t}\n\n\tchatID := message.Chat.ID\n\tc.chatIDs[platformID] = chatID\n\n\tcontent := \"\"\n\tmediaPaths := []string{}\n\n\tchatIDStr := fmt.Sprintf(\"%d\", chatID)\n\tmessageIDStr := fmt.Sprintf(\"%d\", message.MessageID)\n\tscope := channels.BuildMediaScope(\"telegram\", chatIDStr, messageIDStr)\n\n\t// Helper to register a local file with the media store\n\tstoreMedia := func(localPath, filename string) string {\n\t\tif store := c.GetMediaStore(); store != nil {\n\t\t\tref, err := store.Store(localPath, media.MediaMeta{\n\t\t\t\tFilename: filename,\n\t\t\t\tSource:   \"telegram\",\n\t\t\t}, scope)\n\t\t\tif err == nil {\n\t\t\t\treturn ref\n\t\t\t}\n\t\t}\n\t\treturn localPath // fallback: use raw path\n\t}"
+        }
+      ],
+      "explanation": "When a Telegram message arrives, `handleMessage` transforms it from Telegram's world into picoclaw's uniform format. Lines 415-422 construct a `SenderInfo` with the canonical ID format `\"telegram:<user_id>\"`, giving every user a cross-platform identity. Line 425 checks the allowlist *before* doing any expensive work like downloading attachments — a smart optimization that avoids wasting bandwidth on rejected users.\n\nLines 432-454 are where the message content is assembled. The `chatIDs` map (line 433) caches the mapping from user ID to chat ID for future outbound messages. The `storeMedia` closure (lines 443-454) is a clever local helper that registers downloaded files with picoclaw's media store, falling back to raw file paths if the store isn't available. After this snippet, the method continues to extract text, captions, photos, voice notes, audio, and documents — all following the same pattern."
+    },
+    {
+      "id": "chapter-6",
+      "label": "Group Triggers",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/telegram/telegram.go",
+          "startLine": 517,
+          "endLine": 528,
+          "content": "\t// In group chats, apply unified group trigger filtering\n\tif message.Chat.Type != \"private\" {\n\t\tisMentioned := c.isBotMentioned(message)\n\t\tif isMentioned {\n\t\t\tcontent = c.stripBotMention(content)\n\t\t}\n\t\trespond, cleaned := c.ShouldRespondInGroup(isMentioned, content)\n\t\tif !respond {\n\t\t\treturn nil\n\t\t}\n\t\tcontent = cleaned\n\t}"
+        },
+        {
+          "filePath": "pkg/channels/base.go",
+          "startLine": 132,
+          "endLine": 158,
+          "content": "func (c *BaseChannel) ShouldRespondInGroup(isMentioned bool, content string) (bool, string) {\n\tgt := c.groupTrigger\n\n\t// Mentioned \u2192 always respond\n\tif isMentioned {\n\t\treturn true, strings.TrimSpace(content)\n\t}\n\n\t// mention_only \u2192 require mention\n\tif gt.MentionOnly {\n\t\treturn false, content\n\t}\n\n\t// Prefix matching\n\tif len(gt.Prefixes) > 0 {\n\t\tfor _, prefix := range gt.Prefixes {\n\t\t\tif prefix != \"\" && strings.HasPrefix(content, prefix) {\n\t\t\t\treturn true, strings.TrimSpace(strings.TrimPrefix(content, prefix))\n\t\t\t}\n\t\t}\n\t\t// Prefixes configured but none matched and not mentioned \u2192 ignore\n\t\treturn false, content\n\t}\n\n\t// No group_trigger configured \u2192 permissive (respond to all)\n\treturn true, strings.TrimSpace(content)\n}"
+        }
+      ],
+      "explanation": "In group chats, you don't want the bot responding to every message. Lines 518-528 show how picoclaw handles this: first it checks whether the bot was `@mentioned` (line 519), strips the mention from the content (line 521), then delegates the decision to `ShouldRespondInGroup` (line 523). If the method returns `false`, the handler silently drops the message.\n\n`ShouldRespondInGroup` in `base.go` (lines 132-158) implements a three-tier decision tree. If mentioned, always respond (line 136). If `mention_only` is configured, require mention (line 141). If prefix triggers are configured (like `!ask` or `/bot`), respond only when the message starts with a matching prefix and strip it (lines 148-149). With no group trigger config at all, the default is permissive — respond to everything. This logic lives in `BaseChannel` so every channel gets the same behavior for free."
+    },
+    {
+      "id": "chapter-7",
+      "label": "The Bus",
+      "snippets": [
+        {
+          "filePath": "pkg/bus/bus.go",
+          "startLine": 16,
+          "endLine": 48,
+          "content": "type MessageBus struct {\n\tinbound       chan InboundMessage\n\toutbound      chan OutboundMessage\n\toutboundMedia chan OutboundMediaMessage\n\tdone          chan struct{}\n\tclosed        atomic.Bool\n}\n\nfunc NewMessageBus() *MessageBus {\n\treturn &MessageBus{\n\t\tinbound:       make(chan InboundMessage, defaultBusBufferSize),\n\t\toutbound:      make(chan OutboundMessage, defaultBusBufferSize),\n\t\toutboundMedia: make(chan OutboundMediaMessage, defaultBusBufferSize),\n\t\tdone:          make(chan struct{}),\n\t}\n}\n\nfunc (mb *MessageBus) PublishInbound(ctx context.Context, msg InboundMessage) error {\n\tif mb.closed.Load() {\n\t\treturn ErrBusClosed\n\t}\n\tif err := ctx.Err(); err != nil {\n\t\treturn err\n\t}\n\tselect {\n\tcase mb.inbound <- msg:\n\t\treturn nil\n\tcase <-mb.done:\n\t\treturn ErrBusClosed\n\tcase <-ctx.Done():\n\t\treturn ctx.Err()\n\t}\n}"
+        }
+      ],
+      "explanation": "At the heart of picoclaw's message flow sits the `MessageBus` (lines 16-22): three buffered Go channels — `inbound`, `outbound`, and `outboundMedia` — plus a `done` channel for shutdown signaling and an atomic `closed` flag.\n\n`PublishInbound` (lines 33-48) shows the publish pattern used everywhere: check if closed, check context, then attempt a non-blocking send with a `select` that can also abort on shutdown or context cancellation. This design means a slow consumer never blocks the Telegram polling loop indefinitely — the buffer absorbs bursts, and context cancellation provides a clean escape hatch. The bus is the central nervous system: channels publish inbound, the agent consumes and processes, then publishes outbound, and the Manager dispatches back to channels."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Routing Replies",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/manager.go",
+          "startLine": 437,
+          "endLine": 452,
+          "content": "func newChannelWorker(name string, ch Channel) *channelWorker {\n\trateVal := float64(defaultRateLimit)\n\tif r, ok := channelRateConfig[name]; ok {\n\t\trateVal = r\n\t}\n\tburst := int(math.Max(1, math.Ceil(rateVal/2)))\n\n\treturn &channelWorker{\n\t\tch:         ch,\n\t\tqueue:      make(chan bus.OutboundMessage, defaultChannelQueueSize),\n\t\tmediaQueue: make(chan bus.OutboundMediaMessage, defaultChannelQueueSize),\n\t\tdone:       make(chan struct{}),\n\t\tmediaDone:  make(chan struct{}),\n\t\tlimiter:    rate.NewLimiter(rate.Limit(rateVal), burst),\n\t}\n}"
+        },
+        {
+          "filePath": "pkg/channels/manager.go",
+          "startLine": 456,
+          "endLine": 482,
+          "content": "func (m *Manager) runWorker(ctx context.Context, name string, w *channelWorker) {\n\tdefer close(w.done)\n\tfor {\n\t\tselect {\n\t\tcase msg, ok := <-w.queue:\n\t\t\tif !ok {\n\t\t\t\treturn\n\t\t\t}\n\t\t\tmaxLen := 0\n\t\t\tif mlp, ok := w.ch.(MessageLengthProvider); ok {\n\t\t\t\tmaxLen = mlp.MaxMessageLength()\n\t\t\t}\n\t\t\tif maxLen > 0 && len([]rune(msg.Content)) > maxLen {\n\t\t\t\tchunks := SplitMessage(msg.Content, maxLen)\n\t\t\t\tfor _, chunk := range chunks {\n\t\t\t\t\tchunkMsg := msg\n\t\t\t\t\tchunkMsg.Content = chunk\n\t\t\t\t\tm.sendWithRetry(ctx, name, w, chunkMsg)\n\t\t\t\t}\n\t\t\t} else {\n\t\t\t\tm.sendWithRetry(ctx, name, w, msg)\n\t\t\t}\n\t\tcase <-ctx.Done():\n\t\t\treturn\n\t\t}\n\t}\n}"
+        }
+      ],
+      "explanation": "When the agent produces a reply, it lands on the outbound bus. The Manager's dispatcher routes it to the correct channel worker. `newChannelWorker` (lines 437-452) creates a per-channel worker with a dedicated queue and a **rate limiter** — Telegram gets 20 messages per second (from a separate rate config map), while Discord and Slack get just 1 msg/s, reflecting each platform's API limits.\n\n`runWorker` (lines 456-482) is the consumer loop. It reads messages from the queue, checks if the channel provides a `MaxMessageLength` via type assertion (line 466), and if the message exceeds it, splits it using `SplitMessage` (line 469). For Telegram, this threshold is 4096 characters — set back in the constructor. Each chunk is sent via `sendWithRetry`, which handles the pre-send pipeline and exponential backoff."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Typing & Placeholders",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/manager.go",
+          "startLine": 118,
+          "endLine": 148,
+          "content": "func (m *Manager) preSend(ctx context.Context, name string, msg bus.OutboundMessage, ch Channel) bool {\n\tkey := name + \":\" + msg.ChatID\n\n\t// 1. Stop typing\n\tif v, loaded := m.typingStops.LoadAndDelete(key); loaded {\n\t\tif entry, ok := v.(typingEntry); ok {\n\t\t\tentry.stop() // idempotent, safe\n\t\t}\n\t}\n\n\t// 2. Undo reaction\n\tif v, loaded := m.reactionUndos.LoadAndDelete(key); loaded {\n\t\tif entry, ok := v.(reactionEntry); ok {\n\t\t\tentry.undo() // idempotent, safe\n\t\t}\n\t}\n\n\t// 3. Try editing placeholder\n\tif v, loaded := m.placeholders.LoadAndDelete(key); loaded {\n\t\tif entry, ok := v.(placeholderEntry); ok && entry.id != \"\" {\n\t\t\tif editor, ok := ch.(MessageEditor); ok {\n\t\t\t\tif err := editor.EditMessage(ctx, msg.ChatID, entry.id, msg.Content); err == nil {\n\t\t\t\t\treturn true // edited successfully, skip Send\n\t\t\t\t}\n\t\t\t\t// edit failed \u2192 fall through to normal Send\n\t\t\t}\n\t\t}\n\t}\n\n\treturn false\n}"
+        }
+      ],
+      "explanation": "Before actually delivering a reply, `preSend` (lines 118-148) executes a three-step cleanup pipeline. Step 1 (line 122): stop the typing indicator goroutine that was started when the inbound message arrived. Step 2 (line 129): undo any message reaction (like a \"thinking\" emoji). Step 3 (line 136): try to edit the placeholder message with the actual reply content.\n\nIf the placeholder edit succeeds (line 140), `preSend` returns `true` and the caller skips the normal `Send` — the user sees the placeholder morph into the real response, avoiding a duplicate message. If editing fails, it falls through to a normal send. This pipeline is channel-agnostic — it works identically for any channel that implements the right interfaces."
+    },
+    {
+      "id": "chapter-10",
+      "label": "Delivering the Reply",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/telegram/telegram.go",
+          "startLine": 222,
+          "endLine": 249,
+          "content": "func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {\n\tif !c.IsRunning() {\n\t\treturn channels.ErrNotRunning\n\t}\n\n\tchatID, err := parseChatID(msg.ChatID)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"invalid chat ID %s: %w\", msg.ChatID, channels.ErrSendFailed)\n\t}\n\n\thtmlContent := markdownToTelegramHTML(msg.Content)\n\n\t// Typing/placeholder handled by Manager.preSend \u2014 just send the message\n\ttgMsg := tu.Message(tu.ID(chatID), htmlContent)\n\ttgMsg.ParseMode = telego.ModeHTML\n\n\tif _, err = c.bot.SendMessage(ctx, tgMsg); err != nil {\n\t\tlogger.ErrorCF(\"telegram\", \"HTML parse failed, falling back to plain text\", map[string]any{\n\t\t\t\"error\": err.Error(),\n\t\t})\n\t\ttgMsg.ParseMode = \"\"\n\t\tif _, err = c.bot.SendMessage(ctx, tgMsg); err != nil {\n\t\t\treturn fmt.Errorf(\"telegram send: %w\", channels.ErrTemporary)\n\t\t}\n\t}\n\n\treturn nil\n}"
+        }
+      ],
+      "explanation": "`Send()` converts the agent's markdown response into Telegram's supported HTML subset. Line 232 calls `markdownToTelegramHTML`, which handles headings, bold, italic, strikethrough, links, lists, and code blocks with a careful placeholder-based approach that prevents code content from being double-escaped.\n\nLines 238-246 show a pragmatic fallback: if Telegram rejects the HTML (perhaps due to malformed markup), the method retries with `ParseMode: \"\"` — plain text. Better to deliver an ugly message than no message at all."
+    },
+    {
+      "id": "chapter-11",
+      "label": "Staying Alive",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/telegram/telegram.go",
+          "startLine": 255,
+          "endLine": 279,
+          "content": "func (c *TelegramChannel) StartTyping(ctx context.Context, chatID string) (func(), error) {\n\tcid, err := parseChatID(chatID)\n\tif err != nil {\n\t\treturn func() {}, err\n\t}\n\n\t// Send the first typing action immediately\n\t_ = c.bot.SendChatAction(ctx, tu.ChatAction(tu.ID(cid), telego.ChatActionTyping))\n\n\ttypingCtx, cancel := context.WithCancel(ctx)\n\tgo func() {\n\t\tticker := time.NewTicker(4 * time.Second)\n\t\tdefer ticker.Stop()\n\t\tfor {\n\t\t\tselect {\n\t\t\tcase <-typingCtx.Done():\n\t\t\t\treturn\n\t\t\tcase <-ticker.C:\n\t\t\t\t_ = c.bot.SendChatAction(typingCtx, tu.ChatAction(tu.ID(cid), telego.ChatActionTyping))\n\t\t\t}\n\t\t}\n\t}()\n\n\treturn cancel, nil\n}"
+        }
+      ],
+      "explanation": "Telegram's typing indicator expires after about 5 seconds, but AI processing can take much longer. `StartTyping` solves this with a background goroutine that sends `ChatAction(typing)` every 4 seconds (line 266). Line 262 fires the first typing action immediately so the user sees feedback right away, then the ticker keeps it alive.\n\nThe returned `cancel` function stops the goroutine cleanly — and it's idempotent, so calling it multiple times is safe. This matters because the Manager's `preSend` will call it, but context cancellation or the TTL janitor might also trigger cleanup."
+    },
+    {
+      "id": "chapter-12",
+      "label": "Photos & Files",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/telegram/telegram.go",
+          "startLine": 326,
+          "endLine": 341,
+          "content": "func (c *TelegramChannel) SendMedia(ctx context.Context, msg bus.OutboundMediaMessage) error {\n\tif !c.IsRunning() {\n\t\treturn channels.ErrNotRunning\n\t}\n\n\tchatID, err := parseChatID(msg.ChatID)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"invalid chat ID %s: %w\", msg.ChatID, channels.ErrSendFailed)\n\t}\n\n\tstore := c.GetMediaStore()\n\tif store == nil {\n\t\treturn fmt.Errorf(\"no media store available: %w\", channels.ErrSendFailed)\n\t}\n\n\tfor _, part := range msg.Parts {"
+        },
+        {
+          "filePath": "pkg/channels/telegram/telegram.go",
+          "startLine": 360,
+          "endLine": 391,
+          "content": "\t\tswitch part.Type {\n\t\tcase \"image\":\n\t\t\tparams := &telego.SendPhotoParams{\n\t\t\t\tChatID:  tu.ID(chatID),\n\t\t\t\tPhoto:   telego.InputFile{File: file},\n\t\t\t\tCaption: part.Caption,\n\t\t\t}\n\t\t\t_, err = c.bot.SendPhoto(ctx, params)\n\t\tcase \"audio\":\n\t\t\tparams := &telego.SendAudioParams{\n\t\t\t\tChatID:  tu.ID(chatID),\n\t\t\t\tAudio:   telego.InputFile{File: file},\n\t\t\t\tCaption: part.Caption,\n\t\t\t}\n\t\t\t_, err = c.bot.SendAudio(ctx, params)\n\t\tcase \"video\":\n\t\t\tparams := &telego.SendVideoParams{\n\t\t\t\tChatID:  tu.ID(chatID),\n\t\t\t\tVideo:   telego.InputFile{File: file},\n\t\t\t\tCaption: part.Caption,\n\t\t\t}\n\t\t\t_, err = c.bot.SendVideo(ctx, params)\n\t\tdefault: // \"file\" or unknown types\n\t\t\tparams := &telego.SendDocumentParams{\n\t\t\t\tChatID:   tu.ID(chatID),\n\t\t\t\tDocument: telego.InputFile{File: file},\n\t\t\t\tCaption:  part.Caption,\n\t\t\t}\n\t\t\t_, err = c.bot.SendDocument(ctx, params)\n\t\t}\n\n\t\tfile.Close()"
+        }
+      ],
+      "explanation": "Outbound media — images, audio, video, and documents — flows through `SendMedia`. The first snippet (lines 326-341) shows the setup: guard clauses, chat ID parsing, and media store validation before entering the loop over message parts.\n\nBetween these two snippets, lines 342-359 handle resolving the media reference to a local file path and opening the file — with error logging for failures that we skip over here. The second snippet (lines 360-391) is the core dispatch: a type switch maps picoclaw's generic media types to Telegram-specific API calls. Each uses `telego.InputFile{File: file}` to stream the file directly without loading it entirely into memory. The `file.Close()` at line 391 ensures the file descriptor is released after sending."
+    },
+    {
+      "id": "chapter-13",
+      "label": "Slash Commands",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/telegram/telegram_commands.go",
+          "startLine": 13,
+          "endLine": 30,
+          "content": "type TelegramCommander interface {\n\tHelp(ctx context.Context, message telego.Message) error\n\tStart(ctx context.Context, message telego.Message) error\n\tShow(ctx context.Context, message telego.Message) error\n\tList(ctx context.Context, message telego.Message) error\n}\n\ntype cmd struct {\n\tbot    *telego.Bot\n\tconfig *config.Config\n}\n\nfunc NewTelegramCommands(bot *telego.Bot, cfg *config.Config) TelegramCommander {\n\treturn &cmd{\n\t\tbot:    bot,\n\t\tconfig: cfg,\n\t}\n}"
+        },
+        {
+          "filePath": "pkg/channels/telegram/telegram_commands.go",
+          "startLine": 56,
+          "endLine": 65,
+          "content": "func (c *cmd) Start(ctx context.Context, message telego.Message) error {\n\t_, err := c.bot.SendMessage(ctx, &telego.SendMessageParams{\n\t\tChatID: telego.ChatID{ID: message.Chat.ID},\n\t\tText:   \"Hello! I am PicoClaw \\ud83e\\udd9e\",\n\t\tReplyParameters: &telego.ReplyParameters{\n\t\t\tMessageID: message.MessageID,\n\t\t},\n\t})\n\treturn err\n}"
+        }
+      ],
+      "explanation": "Four bot commands — `/start`, `/help`, `/show`, `/list` — give users basic introspection without leaving Telegram. The `TelegramCommander` interface (lines 13-18) defines the contract, and the constructor (lines 25-30) creates a `cmd` struct holding the bot and config — simple dependency injection.\n\n`Start` (lines 56-65) is representative of the pattern: receive the message context, send a reply with `ReplyParameters` so Telegram threads it as a response, and return any error. The `/show model` command reports the current AI model and provider, while `/list channels` enumerates all enabled channels. They're intentionally lightweight — just enough to confirm the bot is alive and configured correctly."
+    },
+    {
+      "id": "chapter-14",
+      "label": "Optional Powers",
+      "snippets": [
+        {
+          "filePath": "pkg/channels/interfaces.go",
+          "startLine": 1,
+          "endLine": 41,
+          "content": "package channels\n\nimport \"context\"\n\n// TypingCapable \u2014 channels that can show a typing/thinking indicator.\n// StartTyping begins the indicator and returns a stop function.\n// The stop function MUST be idempotent and safe to call multiple times.\ntype TypingCapable interface {\n\tStartTyping(ctx context.Context, chatID string) (stop func(), err error)\n}\n\n// MessageEditor \u2014 channels that can edit an existing message.\n// messageID is always string; channels convert platform-specific types internally.\ntype MessageEditor interface {\n\tEditMessage(ctx context.Context, chatID string, messageID string, content string) error\n}\n\n// ReactionCapable \u2014 channels that can add a reaction (e.g. \ud83d\udc40) to an inbound message.\n// ReactToMessage adds a reaction and returns an undo function to remove it.\n// The undo function MUST be idempotent and safe to call multiple times.\ntype ReactionCapable interface {\n\tReactToMessage(ctx context.Context, chatID, messageID string) (undo func(), err error)\n}\n\n// PlaceholderCapable \u2014 channels that can send a placeholder message\n// (e.g. \"Thinking... \ud83d\udcad\") that will later be edited to the actual response.\n// The channel MUST also implement MessageEditor for the placeholder to be useful.\n// SendPlaceholder returns the platform message ID of the placeholder so that\n// Manager.preSend can later edit it via MessageEditor.EditMessage.\ntype PlaceholderCapable interface {\n\tSendPlaceholder(ctx context.Context, chatID string) (messageID string, err error)\n}\n\n// PlaceholderRecorder is injected into channels by Manager.\n// Channels call these methods on inbound to register typing/placeholder state.\n// Manager uses the registered state on outbound to stop typing and edit placeholders.\ntype PlaceholderRecorder interface {\n\tRecordPlaceholder(channel, chatID, placeholderID string)\n\tRecordTypingStop(channel, chatID string, stop func())\n\tRecordReactionUndo(channel, chatID string, undo func())\n}"
+        }
+      ],
+      "explanation": "What makes picoclaw's channel system truly extensible is this set of capability interfaces. `TypingCapable` (line 8) lets a channel show a typing indicator. `MessageEditor` (line 14) enables editing existing messages. `ReactionCapable` (line 21) supports adding emoji reactions. `PlaceholderCapable` (line 30) combines with `MessageEditor` to enable the \"Thinking... \u2192 actual response\" pattern.\n\nThe Manager discovers these capabilities at runtime via Go type assertions \u2014 `if tc, ok := ch.(TypingCapable)`. A channel only implements what it supports. Telegram implements all four, while simpler channels might implement none. This is a textbook application of the Interface Segregation Principle: no channel is forced to implement capabilities it doesn't need. The `PlaceholderRecorder` (line 37) completes the picture \u2014 it's injected into channels by the Manager so that inbound handlers can register state that outbound handlers later consume."
+    },
+    {
+      "id": "chapter-15",
+      "label": "Wrapping Up",
+      "snippets": [],
+      "explanation": "Picoclaw's Telegram integration is not a bolt-on or a sidecar \u2014 it's a native channel that plugs into a well-designed extensible architecture. The journey we traced covered the full lifecycle: factory self-registration eliminates coupling, configuration is minimal (three fields), long polling provides a persistent connection without requiring public URLs, and the MessageBus cleanly decouples the Telegram adapter from the AI agent.\n\nSeveral design patterns stood out. The capability interface system lets each channel opt into features like typing indicators, placeholders, and media without a monolithic interface. The pre-send pipeline elegantly coordinates typing stops, reaction undos, and placeholder edits before each reply. Rate limiting and exponential backoff protect against Telegram API limits. And the markdown-to-HTML converter's placeholder technique keeps code blocks safe from double-escaping.\n\nIf you ever needed to build a Telegram sidecar instead, you'd essentially be reimplementing what's already here: a long-polling loop, a message translation layer, and a way to shuttle messages to/from the AI agent. But with picoclaw, you don't have to \u2014 just set `\"enabled\": true` and paste your bot token."
+    }
+  ]
+}

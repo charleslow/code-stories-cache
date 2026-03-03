@@ -1,6 +1,12 @@
 {
   "stories": [
     {
+      "id": "picoclaw-telegram",
+      "title": "Picoclaw's Native Telegram Integration",
+      "commitHash": "435223f500b56b81c2c238c36109401ef5f1ba99",
+      "createdAt": "2026-03-03T12:00:00.000Z"
+    },
+    {
       "id": "picoclaw-security",
       "title": "Is PicoClaw Safe on a Remote Instance? A Security Audit Tour",
       "commitHash": "946af6b53db371a1dba5a09ae52ca3c034d65086",

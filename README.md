@@ -7,6 +7,7 @@ A personal cache of AI-generated code stories for public repositories I want to 
 - [Why GoClaw Requires an API Key (No Claude Code CLI Support)](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=goclaw-claude-code)
 - [How PicoClaw Runs on Your Claude Code Subscription](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=picoclaw-claude-code)
 - [Is PicoClaw Safe on a Remote Instance? A Security Audit Tour](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=picoclaw-security)
+- [Picoclaw's Native Telegram Integration](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=picoclaw-telegram)
 
 ## What is a Code Story?
 
