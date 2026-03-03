@@ -4,8 +4,8 @@ A personal cache of AI-generated code stories for public repositories I want to 
 
 ## Cached Code Stories
 
-- [Why GoClaw Requires an API Key (No Claude Code CLI Support)](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=e9480ae6-e9df-4f22-b42f-33dd5dfe2c7a)
-- [How PicoClaw Runs on Your Claude Code Subscription](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=b295a8f5-4cb4-489a-b16c-f82157bf1468)
+- [Why GoClaw Requires an API Key (No Claude Code CLI Support)](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=goclaw-claude-code)
+- [How PicoClaw Runs on Your Claude Code Subscription](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=picoclaw-claude-code)
 
 ## What is a Code Story?
 
@@ -34,13 +34,17 @@ https://charleslow.github.io/code-stories/?url=https://raw.githubusercontent.com
 ```
 
 **Using the repo shorthand:**
+
 ```
 https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story={story-id}
 ```
+
+Note that the `story-id` is the name of the json file.
 
 ## Workflow
 
 1. Pick a public repo to study
 2. Generate a story: `npx code-stories --repo user/repo "Your question"`
 3. Commit and push the story
+4. Add a link to the README under Cached Code Stories
 4. View it in the browser using the links above
