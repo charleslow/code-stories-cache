@@ -2,6 +2,11 @@
 
 A personal cache of AI-generated code stories for public repositories I want to study. Stories are narrative-driven walkthroughs that explain how codebases work, generated using [code-stories](https://github.com/charleslow/code-stories).
 
+## Cached Code Stories
+
+- [Why GoClaw Requires an API Key (No Claude Code CLI Support)](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=e9480ae6-e9df-4f22-b42f-33dd5dfe2c7a)
+- [How PicoClaw Runs on Your Claude Code Subscription](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=b295a8f5-4cb4-489a-b16c-f82157bf1468)
+
 ## What is a Code Story?
 
 A code story transforms a natural language question about a codebase into an interactive, chapter-by-chapter tour with real code snippets and prose explanations. Each story is a self-contained JSON file.
