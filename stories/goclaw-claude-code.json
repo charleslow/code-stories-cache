@@ -1,0 +1,118 @@
+{
+  "id": "e9480ae6-e9df-4f22-b42f-33dd5dfe2c7a",
+  "title": "Why GoClaw Requires an API Key (No Claude Code CLI Support)",
+  "query": "Does goclaw allow running with claude code subscription (i.e. running claude -p)?",
+  "repo": "sausheong/goclaw",
+  "commitHash": "ced0d28b487605f7d3721f577c7c299ad46f5944",
+  "createdAt": "2026-03-03T12:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "Gateway Overview",
+      "snippets": [],
+      "explanation": "GoClaw is a self-hosted AI agent gateway written in Go. It connects messaging channels — CLI, Telegram, WhatsApp — to LLM providers like Anthropic (Claude) and OpenAI (GPT), running its own agent loop with tool calling, session persistence, and memory.\n\nThe question here is whether GoClaw can use a **Claude Code subscription** instead of a direct Anthropic API key. Claude Code is Anthropic's developer CLI tool; when you run `claude -p \"prompt\"`, it sends your prompt to Claude and streams back a response, all authenticated via your subscription. The appeal is obvious: if you're already paying for Claude Code, can GoClaw piggyback on that instead of requiring a separate API key?\n\nTo find the answer, we'll trace through GoClaw's provider pipeline — from how providers are configured, to how API keys are resolved, to the factory that creates LLM clients, and finally into the agent runtime that consumes streaming responses. By the end, we'll see exactly where the architectural boundary lies and why `claude -p` can't slot in."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Provider Config",
+      "snippets": [
+        {
+          "filePath": "internal/config/config.go",
+          "startLine": 28,
+          "endLine": 33,
+          "content": "// ProviderConfig holds connection details for an LLM provider.\ntype ProviderConfig struct {\n\tKind    string `json:\"kind\"`     // \"openai\", \"anthropic\", \"openai-compatible\"\n\tBaseURL string `json:\"base_url\"` // custom API endpoint (e.g. LiteLLM)\n\tAPIKey  string `json:\"api_key\"`  // API key or auth token\n}"
+        },
+        {
+          "filePath": "internal/config/config.go",
+          "startLine": 54,
+          "endLine": 65,
+          "content": "type AgentConfig struct {\n\tID           string       `json:\"id\"`\n\tName         string       `json:\"name\"`\n\tWorkspace    string       `json:\"workspace\"`\n\tModel        string       `json:\"model\"`\n\tFallbacks    []string     `json:\"fallbacks\"`\n\tSandbox      string       `json:\"sandbox\"`                    // \"none\", \"docker\", \"namespace\"\n\tMaxTurns     int          `json:\"maxTurns,omitempty\"`         // max tool-use loop iterations (0 = default 25)\n\tSystemPrompt string       `json:\"system_prompt,omitempty\"`    // inline system prompt (overrides IDENTITY.md)\n\tTools        ToolPolicy   `json:\"tools\"`\n\tCron         []CronConfig `json:\"cron,omitempty\"`\n}"
+        }
+      ],
+      "explanation": "`ProviderConfig` at line 29 tells us everything about what GoClaw expects from an LLM backend: a `Kind` (one of \"openai\", \"anthropic\", or \"openai-compatible\"), an optional `BaseURL` for custom endpoints, and an `APIKey`. That's it — three fields, all oriented around HTTP API access. There's no field for a CLI binary path, a subprocess command, or a subscription token type.\n\n`AgentConfig` (line 54) references a model as a string like `\"anthropic/claude-sonnet-4-5-20250514\"`, binding each agent to a provider by name. The vocabulary here is exclusively API-centric."
+    },
+    {
+      "id": "chapter-2",
+      "label": "Credential Resolution",
+      "snippets": [
+        {
+          "filePath": "internal/startup/startup.go",
+          "startLine": 35,
+          "endLine": 58,
+          "content": "// ResolveProviderOpts builds ProviderOptions for a given provider name,\n// merging config file settings with environment variables.\n// Env vars take precedence over config values.\nfunc ResolveProviderOpts(name string, cfg *config.Config) llm.ProviderOptions {\n\tpcfg := cfg.GetProvider(name)\n\topts := llm.ProviderOptions{\n\t\tAPIKey:  pcfg.APIKey,\n\t\tBaseURL: pcfg.BaseURL,\n\t\tKind:    pcfg.Kind,\n\t}\n\n\tenvPrefix := strings.ToUpper(name)\n\tif v := os.Getenv(envPrefix + \"_API_KEY\"); v != \"\" {\n\t\topts.APIKey = v\n\t}\n\tif v := os.Getenv(envPrefix + \"_AUTH_TOKEN\"); v != \"\" {\n\t\topts.APIKey = v\n\t}\n\tif v := os.Getenv(envPrefix + \"_BASE_URL\"); v != \"\" {\n\t\topts.BaseURL = v\n\t}\n\n\treturn opts\n}"
+        }
+      ],
+      "explanation": "`ResolveProviderOpts` is the single function responsible for assembling authentication credentials before a provider is created. It starts by reading from the config file (lines 39-44), then checks three environment variables: `{PROVIDER}_API_KEY`, `{PROVIDER}_AUTH_TOKEN`, and `{PROVIDER}_BASE_URL` (lines 47-55). Environment variables win over config values.\n\nWhat's notable is what's *absent*. There's no fallback logic — no \"if API key is missing, try finding the `claude` binary in PATH\" or \"check for an active Claude Code session.\" The function returns a `ProviderOptions` struct, and if `APIKey` is empty, that's the caller's problem. As we'll see next, the caller treats an empty API key as a fatal error."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Provider Factory",
+      "snippets": [
+        {
+          "filePath": "internal/llm/provider.go",
+          "startLine": 84,
+          "endLine": 88,
+          "content": "// LLMProvider is the interface for all LLM backends.\ntype LLMProvider interface {\n\tChatStream(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)\n\tModels() []ModelInfo\n}"
+        },
+        {
+          "filePath": "internal/llm/provider.go",
+          "startLine": 100,
+          "endLine": 130,
+          "content": "// ProviderOptions holds connection details for creating an LLM provider.\ntype ProviderOptions struct {\n\tAPIKey  string\n\tBaseURL string\n\tKind    string // override: \"openai-compatible\" uses OpenAI client with custom URL\n}\n\n// NewProvider creates an LLMProvider for the given provider name.\nfunc NewProvider(providerName string, opts ProviderOptions) (LLMProvider, error) {\n\t// If Kind is set, use it to override the provider type.\n\t// This lets e.g. \"anthropic\" route through an OpenAI-compatible proxy like LiteLLM.\n\tkind := opts.Kind\n\tif kind == \"\" {\n\t\t// If a custom base URL is set, default to openai-compatible\n\t\t// since most proxies (LiteLLM, etc.) expose an OpenAI-compatible API.\n\t\tif opts.BaseURL != \"\" {\n\t\t\tkind = \"openai-compatible\"\n\t\t} else {\n\t\t\tkind = providerName\n\t\t}\n\t}\n\n\tswitch kind {\n\tcase \"anthropic\":\n\t\treturn NewAnthropicProvider(opts.APIKey, opts.BaseURL), nil\n\tcase \"openai\", \"openai-compatible\":\n\t\treturn NewOpenAIProvider(opts.APIKey, opts.BaseURL), nil\n\tdefault:\n\t\treturn nil, fmt.Errorf(\"unknown LLM provider kind: %q\", kind)\n\t}\n}"
+        }
+      ],
+      "explanation": "The `LLMProvider` interface at line 85 defines the contract every LLM backend must fulfill: `ChatStream` returns a channel of `ChatEvent` values (text deltas, tool call starts, tool call completions), and `Models` returns available model metadata. This is a structured streaming protocol — fundamentally different from piping text to a subprocess.\n\n`NewProvider` (line 108) is the factory and the architectural chokepoint. It resolves the provider `kind` through a small decision tree: if `Kind` is explicitly set, use it; otherwise, if there's a custom `BaseURL`, default to \"openai-compatible\"; otherwise, use the provider name itself. Then a three-way switch at lines 122-129 creates either an `AnthropicProvider` or an `OpenAIProvider`. The `default` case returns an error: `\"unknown LLM provider kind\"`.\n\nThis is where the door closes for `claude -p`. There's no `case \"cli\"` or `case \"subprocess\"` branch. Adding one would require implementing a new `LLMProvider` that shells out to the `claude` binary, parses its output, and maps it back to the structured `ChatEvent` protocol — a non-trivial undertaking given that `claude -p` doesn't expose tool-call metadata in a machine-readable format."
+    },
+    {
+      "id": "chapter-4",
+      "label": "Anthropic SDK Wiring",
+      "snippets": [
+        {
+          "filePath": "internal/llm/anthropic.go",
+          "startLine": 13,
+          "endLine": 27,
+          "content": "// AnthropicProvider implements LLMProvider using the Anthropic Messages API.\ntype AnthropicProvider struct {\n\tclient anthropic.Client\n}\n\n// NewAnthropicProvider creates a new Anthropic LLM provider.\n// If baseURL is non-empty, the client points to that endpoint.\nfunc NewAnthropicProvider(apiKey, baseURL string) *AnthropicProvider {\n\topts := []option.RequestOption{option.WithAPIKey(apiKey)}\n\tif baseURL != \"\" {\n\t\topts = append(opts, option.WithBaseURL(baseURL))\n\t}\n\tclient := anthropic.NewClient(opts...)\n\treturn &AnthropicProvider{client: client}\n}"
+        },
+        {
+          "filePath": "internal/llm/anthropic.go",
+          "startLine": 148,
+          "endLine": 169,
+          "content": "\tparams := anthropic.MessageNewParams{\n\t\tModel:     anthropic.Model(model),\n\t\tMaxTokens: maxTokens,\n\t\tMessages:  msgs,\n\t}\n\n\tif len(tools) > 0 {\n\t\tparams.Tools = tools\n\t}\n\n\tif req.SystemPrompt != \"\" {\n\t\tparams.System = []anthropic.TextBlockParam{\n\t\t\t{Text: req.SystemPrompt},\n\t\t}\n\t}\n\n\tif req.Temperature > 0 {\n\t\tparams.Temperature = anthropic.Float(req.Temperature)\n\t}\n\n\t// Create stream\n\tstream := p.client.Messages.NewStreaming(ctx, params)"
+        }
+      ],
+      "explanation": "`NewAnthropicProvider` at line 20 constructs an API client using the official Go SDK (`anthropic-sdk-go`). The API key is passed directly via `option.WithAPIKey(apiKey)` at line 21. If a custom `baseURL` is provided, it's added as well — this is how you'd point GoClaw at an Anthropic-compatible proxy, but it still expects a key.\n\nFurther down, `ChatStream` builds `MessageNewParams` at line 148 and calls `p.client.Messages.NewStreaming(ctx, params)` at line 169. This is a direct HTTP/SSE connection to the Anthropic Messages API. The SDK handles authentication headers, request serialization, and SSE event parsing — all things that `claude -p` handles internally but doesn't expose to external tools. GoClaw is talking Anthropic's wire protocol directly, not invoking a CLI wrapper around it."
+    },
+    {
+      "id": "chapter-5",
+      "label": "API Key Gate",
+      "snippets": [
+        {
+          "filePath": "cmd/goclaw/main.go",
+          "startLine": 165,
+          "endLine": 205,
+          "content": "func runChat(agentID, configPath, modelOverride string) error {\n\tcfg, err := config.Load(configPath)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"load config: %w\", err)\n\t}\n\n\tagentCfg, ok := cfg.GetAgent(agentID)\n\tif !ok {\n\t\treturn fmt.Errorf(\"agent %q not found in config\", agentID)\n\t}\n\n\tmodelStr := agentCfg.Model\n\tif modelOverride != \"\" {\n\t\tmodelStr = modelOverride\n\t}\n\n\tproviderName, modelName := llm.ParseProviderModel(modelStr)\n\n\t// If no provider prefix in the model string, inherit from the agent's config\n\tif providerName == \"\" {\n\t\tproviderName, _ = llm.ParseProviderModel(agentCfg.Model)\n\t}\n\t// Last resort default\n\tif providerName == \"\" {\n\t\tproviderName = \"anthropic\"\n\t}\n\n\topts := startup.ResolveProviderOpts(providerName, cfg)\n\tif opts.APIKey == \"\" {\n\t\treturn fmt.Errorf(\"no API key set for provider %q (set %s_API_KEY or %s_AUTH_TOKEN env var)\",\n\t\t\tproviderName, strings.ToUpper(providerName), strings.ToUpper(providerName))\n\t}\n\n\tif opts.BaseURL != \"\" {\n\t\tslog.Info(\"using custom base URL\", \"provider\", providerName, \"base_url\", opts.BaseURL)\n\t}\n\n\tprovider, err := llm.NewProvider(providerName, opts)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"create LLM provider: %w\", err)\n\t}"
+        }
+      ],
+      "explanation": "`runChat` is the entry point when you type `goclaw chat`. Lines 176-189 parse the model string and resolve the provider name, with \"anthropic\" as the last-resort default. Then line 192 calls `ResolveProviderOpts` from the startup package, and lines 193-195 deliver the verdict: if `opts.APIKey` is empty, you get a hard error with a helpful message telling you to set `{PROVIDER}_API_KEY` or `{PROVIDER}_AUTH_TOKEN`.\n\nThere's no \"soft\" path here — no prompt asking \"would you like to use Claude Code instead?\" The API key is a non-negotiable prerequisite. Even if you have `claude` installed and authenticated on your machine, GoClaw doesn't know about it and wouldn't know how to use it."
+    },
+    {
+      "id": "chapter-6",
+      "label": "Streaming Event Contract",
+      "snippets": [
+        {
+          "filePath": "internal/agent/runtime.go",
+          "startLine": 114,
+          "endLine": 151,
+          "content": "\t\t\treq := llm.ChatRequest{\n\t\t\t\tModel:        r.Model,\n\t\t\t\tMessages:     msgs,\n\t\t\t\tTools:        toolDefs,\n\t\t\t\tMaxTokens:    8192,\n\t\t\t\tSystemPrompt: systemPrompt,\n\t\t\t}\n\n\t\t\t// Call LLM\n\t\t\tstream, err := r.LLM.ChatStream(ctx, req)\n\t\t\tif err != nil {\n\t\t\t\tevents <- AgentEvent{Type: EventError, Error: fmt.Errorf(\"llm error: %w\", err)}\n\t\t\t\treturn\n\t\t\t}\n\n\t\t\t// Collect the response\n\t\t\tvar textContent strings.Builder\n\t\t\tvar toolCalls []llm.ToolCall\n\n\t\t\tfor event := range stream {\n\t\t\t\tswitch event.Type {\n\t\t\t\tcase llm.EventTextDelta:\n\t\t\t\t\ttextContent.WriteString(event.Text)\n\t\t\t\t\tevents <- AgentEvent{Type: EventTextDelta, Text: event.Text}\n\n\t\t\t\tcase llm.EventToolCallStart:\n\t\t\t\t\tevents <- AgentEvent{Type: EventToolCallStart, ToolCall: event.ToolCall}\n\n\t\t\t\tcase llm.EventToolCallDone:\n\t\t\t\t\tif event.ToolCall != nil {\n\t\t\t\t\t\ttoolCalls = append(toolCalls, *event.ToolCall)\n\t\t\t\t\t}\n\n\t\t\t\tcase llm.EventError:\n\t\t\t\t\tevents <- AgentEvent{Type: EventError, Error: event.Error}\n\t\t\t\t\treturn\n\t\t\t\t}\n\t\t\t}"
+        }
+      ],
+      "explanation": "The agent runtime's think-act loop reveals why a simple CLI wrapper wouldn't suffice. At line 123, `r.LLM.ChatStream` is called, returning a channel of structured events. The `for event := range stream` loop at line 133 dispatches on event types: `EventTextDelta` for streaming text tokens (lines 135-137), `EventToolCallStart` when the LLM wants to invoke a tool (lines 139-140), and `EventToolCallDone` when a tool call's arguments are fully assembled (lines 142-145).\n\nThis structured event protocol is essential to GoClaw's agent loop. When Claude decides to call the `bash` tool or `read_file`, GoClaw receives that as a typed `ToolCall` with a name and JSON input — not as embedded text in a response. `claude -p` doesn't expose this structured information; it handles tool execution internally and returns only the final text. GoClaw needs the raw tool calls to apply its own tool policies, execute tools in its sandbox, and maintain session state."
+    },
+    {
+      "id": "chapter-7",
+      "label": "The Verdict",
+      "snippets": [],
+      "explanation": "The answer is clear: **GoClaw does not support running with a Claude Code subscription.** The provider pipeline is built end-to-end around direct HTTP API access. Configuration expects API keys (`ProviderConfig.APIKey`), resolution merges config with environment variables (`ResolveProviderOpts`), the factory creates SDK-based HTTP clients (`NewProvider`), and the agent runtime consumes structured streaming events that only come from API responses (`ChatStream`).\n\nThe fundamental incompatibility isn't just authentication — it's the communication protocol. GoClaw's agent loop depends on receiving individual tool call events from the LLM so it can apply tool policies, execute tools in its own sandbox, and persist results to sessions. `claude -p` is a self-contained agent that handles tool execution internally and returns only the final text answer. These are two different architectures: GoClaw is an agent framework that uses LLMs as a component, while `claude -p` is itself a complete agent.\n\nIf you want to use Claude with GoClaw, you need an Anthropic API key (set via `ANTHROPIC_API_KEY` or in `goclaw.json5`). A Claude Code subscription and an Anthropic API key are separate products with separate billing."
+    }
+  ]
+}

@@ -1,0 +1,170 @@
+{
+  "id": "b295a8f5-4cb4-489a-b16c-f82157bf1468",
+  "title": "How PicoClaw Runs on Your Claude Code Subscription",
+  "query": "Does picoclaw allow running with claude code subscription (i.e. running claude -p)?",
+  "repo": "sipeed/picoclaw",
+  "commitHash": "946af6b53db371a1dba5a09ae52ca3c034d65086",
+  "createdAt": "2026-03-03T12:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "The Big Picture",
+      "snippets": [],
+      "explanation": "**The short answer is yes** — PicoClaw fully supports running with a Claude Code subscription. It does this through a dedicated `ClaudeCliProvider` that shells out to the `claude` CLI binary in \"pipe mode\" (`claude -p`), meaning PicoClaw never touches API keys or authentication for this path. If you have Claude Code installed and authenticated (via a Pro or Max subscription), PicoClaw can use it as its LLM backend.\n\nThis story walks through how that integration works: from the provider interface that all LLM backends must satisfy, through the subprocess execution that calls `claude -p`, the JSON response parsing, and finally the configuration pathways that let you enable it. Key terms to know: **pipe mode** is Claude Code's non-interactive mode activated by the `-p` flag, and **model_list** is PicoClaw's configuration format where each LLM backend is declared with a protocol prefix like `claude-cli/`."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Provider Contract",
+      "snippets": [
+        {
+          "filePath": "pkg/providers/types.go",
+          "startLine": 24,
+          "endLine": 33,
+          "content": "type LLMProvider interface {\n\tChat(\n\t\tctx context.Context,\n\t\tmessages []Message,\n\t\ttools []ToolDefinition,\n\t\tmodel string,\n\t\toptions map[string]any,\n\t) (*LLMResponse, error)\n\tGetDefaultModel() string\n}"
+        }
+      ],
+      "explanation": "The `LLMProvider` interface is the foundation every LLM backend builds on. It requires just two methods: `Chat()` for sending messages and receiving responses, and `GetDefaultModel()` for reporting the provider's default model identifier. This minimal contract — defined at lines 24–33 — is what allows PicoClaw to treat an HTTP API call to Anthropic, a local Ollama instance, and a `claude -p` subprocess all interchangeably. The design deliberately keeps the interface narrow: no streaming, no connection management, just request-response with tool support."
+    },
+    {
+      "id": "chapter-2",
+      "label": "CLI Provider Struct",
+      "snippets": [
+        {
+          "filePath": "pkg/providers/claude_cli_provider.go",
+          "startLine": 12,
+          "endLine": 24,
+          "content": "// ClaudeCliProvider implements LLMProvider using the claude CLI as a subprocess.\ntype ClaudeCliProvider struct {\n\tcommand   string\n\tworkspace string\n}\n\n// NewClaudeCliProvider creates a new Claude CLI provider.\nfunc NewClaudeCliProvider(workspace string) *ClaudeCliProvider {\n\treturn &ClaudeCliProvider{\n\t\tcommand:   \"claude\",\n\t\tworkspace: workspace,\n\t}\n}"
+        }
+      ],
+      "explanation": "`ClaudeCliProvider` at line 13 has just two fields: `command` (the path to the CLI binary) and `workspace` (the working directory). The constructor on line 19 hardcodes `command` to `\"claude\"` — it assumes the Claude Code binary is on your PATH. There's no API key field, no token, no authentication configuration whatsoever. That's the key insight: all auth is delegated to the `claude` binary itself, which manages its own subscription credentials. This is what makes the Claude Code subscription path zero-configuration from PicoClaw's perspective."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Executing the CLI",
+      "snippets": [
+        {
+          "filePath": "pkg/providers/claude_cli_provider.go",
+          "startLine": 27,
+          "endLine": 60,
+          "content": "func (p *ClaudeCliProvider) Chat(\n\tctx context.Context, messages []Message, tools []ToolDefinition, model string, options map[string]any,\n) (*LLMResponse, error) {\n\tsystemPrompt := p.buildSystemPrompt(messages, tools)\n\tprompt := p.messagesToPrompt(messages)\n\n\targs := []string{\"-p\", \"--output-format\", \"json\", \"--dangerously-skip-permissions\", \"--no-chrome\"}\n\tif systemPrompt != \"\" {\n\t\targs = append(args, \"--system-prompt\", systemPrompt)\n\t}\n\tif model != \"\" && model != \"claude-code\" {\n\t\targs = append(args, \"--model\", model)\n\t}\n\targs = append(args, \"-\") // read from stdin\n\n\tcmd := exec.CommandContext(ctx, p.command, args...)\n\tif p.workspace != \"\" {\n\t\tcmd.Dir = p.workspace\n\t}\n\tcmd.Stdin = bytes.NewReader([]byte(prompt))\n\n\tvar stdout, stderr bytes.Buffer\n\tcmd.Stdout = &stdout\n\tcmd.Stderr = &stderr\n\n\tif err := cmd.Run(); err != nil {\n\t\tif stderrStr := stderr.String(); stderrStr != \"\" {\n\t\t\treturn nil, fmt.Errorf(\"claude cli error: %s\", stderrStr)\n\t\t}\n\t\treturn nil, fmt.Errorf(\"claude cli error: %w\", err)\n\t}\n\n\treturn p.parseClaudeCliResponse(stdout.String())\n}"
+        }
+      ],
+      "explanation": "`Chat()` is where the subprocess invocation happens. Line 33 reveals the core arguments: `-p` activates pipe mode for non-interactive use, `--output-format json` requests structured output, `--dangerously-skip-permissions` disables Claude Code's built-in permission prompts (since PicoClaw handles tool execution itself), and `--no-chrome` prevents browser windows from opening — essential for headless and embedded deployments.\n\nLines 37–39 show a subtle detail: the `--model` flag is only passed when the model isn't empty *and* isn't `\"claude-code\"`. This means you can either let Claude Code use its own default model, or override it with a specific model like `claude-sonnet-4.6`. The prompt is fed via stdin (line 40's `\"-\"` argument and line 46's stdin pipe), and the response is captured from stdout. Context cancellation at line 42 via `exec.CommandContext` ensures the subprocess is killed if the request times out."
+    },
+    {
+      "id": "chapter-4",
+      "label": "Message Conversion",
+      "snippets": [
+        {
+          "filePath": "pkg/providers/claude_cli_provider.go",
+          "startLine": 68,
+          "endLine": 90,
+          "content": "func (p *ClaudeCliProvider) messagesToPrompt(messages []Message) string {\n\tvar parts []string\n\n\tfor _, msg := range messages {\n\t\tswitch msg.Role {\n\t\tcase \"system\":\n\t\t\t// handled via --system-prompt flag\n\t\tcase \"user\":\n\t\t\tparts = append(parts, \"User: \"+msg.Content)\n\t\tcase \"assistant\":\n\t\t\tparts = append(parts, \"Assistant: \"+msg.Content)\n\t\tcase \"tool\":\n\t\t\tparts = append(parts, fmt.Sprintf(\"[Tool Result for %s]: %s\", msg.ToolCallID, msg.Content))\n\t\t}\n\t}\n\n\t// Simplify single user message\n\tif len(parts) == 1 && strings.HasPrefix(parts[0], \"User: \") {\n\t\treturn strings.TrimPrefix(parts[0], \"User: \")\n\t}\n\n\treturn strings.Join(parts, \"\\n\")\n}"
+        },
+        {
+          "filePath": "pkg/providers/claude_cli_provider.go",
+          "startLine": 93,
+          "endLine": 107,
+          "content": "func (p *ClaudeCliProvider) buildSystemPrompt(messages []Message, tools []ToolDefinition) string {\n\tvar parts []string\n\n\tfor _, msg := range messages {\n\t\tif msg.Role == \"system\" {\n\t\t\tparts = append(parts, msg.Content)\n\t\t}\n\t}\n\n\tif len(tools) > 0 {\n\t\tparts = append(parts, buildCLIToolsPrompt(tools))\n\t}\n\n\treturn strings.Join(parts, \"\\n\\n\")\n}"
+        }
+      ],
+      "explanation": "Before sending messages to the CLI, they need to be converted into a text format. `messagesToPrompt` (lines 68–90) handles this transformation. System messages are skipped here because they're routed separately via the `--system-prompt` flag. User and assistant messages get simple prefixes, while tool results are formatted with their call ID for traceability. Lines 85–87 apply a nice optimization: if there's only a single user message, the `\"User: \"` prefix is stripped, keeping the prompt clean.\n\n`buildSystemPrompt` (lines 93–107) gathers all system messages and, if tools are defined, appends their descriptions. These are joined with double newlines and passed as a single `--system-prompt` argument, keeping the system context separate from the conversation flow."
+    },
+    {
+      "id": "chapter-5",
+      "label": "Parsing Responses",
+      "snippets": [
+        {
+          "filePath": "pkg/providers/claude_cli_provider.go",
+          "startLine": 110,
+          "endLine": 144,
+          "content": "func (p *ClaudeCliProvider) parseClaudeCliResponse(output string) (*LLMResponse, error) {\n\tvar resp claudeCliJSONResponse\n\tif err := json.Unmarshal([]byte(output), &resp); err != nil {\n\t\treturn nil, fmt.Errorf(\"failed to parse claude cli response: %w\", err)\n\t}\n\n\tif resp.IsError {\n\t\treturn nil, fmt.Errorf(\"claude cli returned error: %s\", resp.Result)\n\t}\n\n\ttoolCalls := p.extractToolCalls(resp.Result)\n\n\tfinishReason := \"stop\"\n\tcontent := resp.Result\n\tif len(toolCalls) > 0 {\n\t\tfinishReason = \"tool_calls\"\n\t\tcontent = p.stripToolCallsJSON(resp.Result)\n\t}\n\n\tvar usage *UsageInfo\n\tif resp.Usage.InputTokens > 0 || resp.Usage.OutputTokens > 0 {\n\t\tusage = &UsageInfo{\n\t\t\tPromptTokens:     resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens,\n\t\t\tCompletionTokens: resp.Usage.OutputTokens,\n\t\t\tTotalTokens:      resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens + resp.Usage.OutputTokens,\n\t\t}\n\t}\n\n\treturn &LLMResponse{\n\t\tContent:      strings.TrimSpace(content),\n\t\tToolCalls:    toolCalls,\n\t\tFinishReason: finishReason,\n\t\tUsage:        usage,\n\t}, nil\n}"
+        },
+        {
+          "filePath": "pkg/providers/claude_cli_provider.go",
+          "startLine": 172,
+          "endLine": 193,
+          "content": "// claudeCliJSONResponse represents the JSON output from the claude CLI.\n// Matches the real claude CLI v2.x output format.\ntype claudeCliJSONResponse struct {\n\tType         string             `json:\"type\"`\n\tSubtype      string             `json:\"subtype\"`\n\tIsError      bool               `json:\"is_error\"`\n\tResult       string             `json:\"result\"`\n\tSessionID    string             `json:\"session_id\"`\n\tTotalCostUSD float64            `json:\"total_cost_usd\"`\n\tDurationMS   int                `json:\"duration_ms\"`\n\tDurationAPI  int                `json:\"duration_api_ms\"`\n\tNumTurns     int                `json:\"num_turns\"`\n\tUsage        claudeCliUsageInfo `json:\"usage\"`\n}\n\n// claudeCliUsageInfo represents token usage from the claude CLI response.\ntype claudeCliUsageInfo struct {\n\tInputTokens              int `json:\"input_tokens\"`\n\tOutputTokens             int `json:\"output_tokens\"`\n\tCacheCreationInputTokens int `json:\"cache_creation_input_tokens\"`\n\tCacheReadInputTokens     int `json:\"cache_read_input_tokens\"`\n}"
+        }
+      ],
+      "explanation": "`parseClaudeCliResponse` on line 110 deserializes the JSON output into a `claudeCliJSONResponse` struct. After checking for errors (line 116), it extracts tool calls from the result text (line 120) and adjusts the finish reason accordingly — `\"tool_calls\"` if tools were invoked, `\"stop\"` otherwise.\n\nLines 130–136 handle usage statistics, combining input tokens with cache tokens (both creation and read) into a unified `PromptTokens` count. This is worth noting: Claude Code's caching system means repeated prompts can be much cheaper, and PicoClaw surfaces that information.\n\nThe response types defined at lines 172–193 mirror the real Claude CLI v2.x output format exactly. The `claudeCliJSONResponse` struct captures everything from session IDs to cost tracking (`TotalCostUSD`), duration metrics, and the nested `claudeCliUsageInfo` for token accounting. This fidelity means PicoClaw can report accurate cost and performance data even when running through the CLI."
+    },
+    {
+      "id": "chapter-6",
+      "label": "Tool Call Extraction",
+      "snippets": [
+        {
+          "filePath": "pkg/providers/tool_call_extract.go",
+          "startLine": 8,
+          "endLine": 57,
+          "content": "// extractToolCallsFromText parses tool call JSON from response text.\n// Both ClaudeCliProvider and CodexCliProvider use this to extract\n// tool calls that the model outputs in its response text.\nfunc extractToolCallsFromText(text string) []ToolCall {\n\tstart := strings.Index(text, `{\"tool_calls\"`)\n\tif start == -1 {\n\t\treturn nil\n\t}\n\n\tend := findMatchingBrace(text, start)\n\tif end == start {\n\t\treturn nil\n\t}\n\n\tjsonStr := text[start:end]\n\n\tvar wrapper struct {\n\t\tToolCalls []struct {\n\t\t\tID       string `json:\"id\"`\n\t\t\tType     string `json:\"type\"`\n\t\t\tFunction struct {\n\t\t\t\tName      string `json:\"name\"`\n\t\t\t\tArguments string `json:\"arguments\"`\n\t\t\t} `json:\"function\"`\n\t\t} `json:\"tool_calls\"`\n\t}\n\n\tif err := json.Unmarshal([]byte(jsonStr), &wrapper); err != nil {\n\t\treturn nil\n\t}\n\n\tvar result []ToolCall\n\tfor _, tc := range wrapper.ToolCalls {\n\t\tvar args map[string]any\n\t\tjson.Unmarshal([]byte(tc.Function.Arguments), &args)\n\n\t\tresult = append(result, ToolCall{\n\t\t\tID:        tc.ID,\n\t\t\tType:      tc.Type,\n\t\t\tName:      tc.Function.Name,\n\t\t\tArguments: args,\n\t\t\tFunction: &FunctionCall{\n\t\t\t\tName:      tc.Function.Name,\n\t\t\t\tArguments: tc.Function.Arguments,\n\t\t\t},\n\t\t})\n\t}\n\n\treturn result\n}"
+        }
+      ],
+      "explanation": "`extractToolCallsFromText` at line 11 solves a specific challenge: when the Claude CLI returns tool calls, they're embedded as JSON within the response text rather than in a separate structured field. The function searches for a `{\"tool_calls\"` marker (line 12), uses `findMatchingBrace` to locate the complete JSON object, then unmarshals the tool calls. Each call's arguments string is parsed into a `map[string]any` for structured access (line 42), while the raw JSON string is preserved in the `FunctionCall` struct (line 51).\n\nThe comment on lines 8–10 reveals this is shared between `ClaudeCliProvider` and `CodexCliProvider` (OpenAI's CLI equivalent) — a pragmatic reuse since both CLI tools embed tool calls the same way. Now that we've seen how the provider works internally, let's look at how users configure it."
+    },
+    {
+      "id": "chapter-7",
+      "label": "Model Configuration",
+      "snippets": [
+        {
+          "filePath": "pkg/config/config.go",
+          "startLine": 469,
+          "endLine": 493,
+          "content": "// ModelConfig represents a model-centric provider configuration.\n// It allows adding new providers (especially OpenAI-compatible ones) via configuration only.\n// The model field uses protocol prefix format: [protocol/]model-identifier\n// Supported protocols: openai, anthropic, antigravity, claude-cli, codex-cli, github-copilot\n// Default protocol is \"openai\" if no prefix is specified.\ntype ModelConfig struct {\n\t// Required fields\n\tModelName string `json:\"model_name\"` // User-facing alias for the model\n\tModel     string `json:\"model\"`      // Protocol/model-identifier (e.g., \"openai/gpt-4o\", \"anthropic/claude-sonnet-4.6\")\n\n\t// HTTP-based providers\n\tAPIBase string `json:\"api_base,omitempty\"` // API endpoint URL\n\tAPIKey  string `json:\"api_key\"`            // API authentication key\n\tProxy   string `json:\"proxy,omitempty\"`    // HTTP proxy URL\n\n\t// Special providers (CLI-based, OAuth, etc.)\n\tAuthMethod  string `json:\"auth_method,omitempty\"`  // Authentication method: oauth, token\n\tConnectMode string `json:\"connect_mode,omitempty\"` // Connection mode: stdio, grpc\n\tWorkspace   string `json:\"workspace,omitempty\"`    // Workspace path for CLI-based providers\n\n\t// Optional optimizations\n\tRPM            int    `json:\"rpm,omitempty\"`              // Requests per minute limit\n\tMaxTokensField string `json:\"max_tokens_field,omitempty\"` // Field name for max tokens (e.g., \"max_completion_tokens\")\n\tRequestTimeout int    `json:\"request_timeout,omitempty\"`\n}"
+        }
+      ],
+      "explanation": "`ModelConfig` at line 474 is the configuration struct that makes all this possible from the user's perspective. The two required fields are `ModelName` (a user-facing alias like `\"claude-code\"`) and `Model` (the protocol-prefixed identifier like `\"claude-cli/claude-sonnet-4.6\"`).\n\nNotice how the struct's fields are organized into three groups: HTTP-based fields (APIBase, APIKey, Proxy) on lines 480–482, special provider fields (AuthMethod, ConnectMode, Workspace) on lines 485–487, and optional optimizations on lines 490–492. For the `claude-cli` protocol, only `Workspace` matters from the special fields — no API key, no auth method. The comment on line 472 explicitly lists `claude-cli` as a supported protocol."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Protocol Routing",
+      "snippets": [
+        {
+          "filePath": "pkg/providers/factory_provider.go",
+          "startLine": 39,
+          "endLine": 52,
+          "content": "// ExtractProtocol extracts the protocol prefix and model identifier from a model string.\n// If no prefix is specified, it defaults to \"openai\".\n// Examples:\n//   - \"openai/gpt-4o\" -> (\"openai\", \"gpt-4o\")\n//   - \"anthropic/claude-sonnet-4.6\" -> (\"anthropic\", \"claude-sonnet-4.6\")\n//   - \"gpt-4o\" -> (\"openai\", \"gpt-4o\")  // default protocol\nfunc ExtractProtocol(model string) (protocol, modelID string) {\n\tmodel = strings.TrimSpace(model)\n\tprotocol, modelID, found := strings.Cut(model, \"/\")\n\tif !found {\n\t\treturn \"openai\", model\n\t}\n\treturn protocol, modelID\n}"
+        },
+        {
+          "filePath": "pkg/providers/factory_provider.go",
+          "startLine": 142,
+          "endLine": 148,
+          "content": "\tcase \"claude-cli\", \"claudecli\":\n\t\tworkspace := cfg.Workspace\n\t\tif workspace == \"\" {\n\t\t\tworkspace = \".\"\n\t\t}\n\t\treturn NewClaudeCliProvider(workspace), modelID, nil"
+        }
+      ],
+      "explanation": "`ExtractProtocol` on line 45 is the dispatcher's first step — it splits a model string at the `/` delimiter. `\"claude-cli/claude-sonnet-4.6\"` becomes protocol `\"claude-cli\"` and modelID `\"claude-sonnet-4.6\"`. If there's no slash, it defaults to `\"openai\"` (line 49), reflecting PicoClaw's pragmatic choice of most-common-case default.\n\nDown at line 142, the `claude-cli` and `claudecli` cases handle the actual provider instantiation. The workspace falls back to `\".\"` (current directory) if not configured. Then `NewClaudeCliProvider(workspace)` creates the provider — and that's it. No API key validation, no token exchange. The simplicity here is striking compared to the HTTP provider cases above it in the same switch statement, which all require API keys or auth configuration."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Legacy Config Path",
+      "snippets": [
+        {
+          "filePath": "pkg/providers/factory.go",
+          "startLine": 156,
+          "endLine": 163,
+          "content": "\t\tcase \"claude-cli\", \"claude-code\", \"claudecode\":\n\t\t\tworkspace := cfg.WorkspacePath()\n\t\t\tif workspace == \"\" {\n\t\t\t\tworkspace = \".\"\n\t\t\t}\n\t\t\tsel.providerType = providerTypeClaudeCLI\n\t\t\tsel.workspace = workspace\n\t\t\treturn sel, nil"
+        }
+      ],
+      "explanation": "For users who prefer the older configuration style with a `providers.provider` field, `resolveProviderSelection` in `factory.go` handles the mapping. Line 156 matches three aliases: `\"claude-cli\"`, `\"claude-code\"`, and `\"claudecode\"`. All three route to `providerTypeClaudeCLI`. This ensures backward compatibility — users who configured `provider: \"claude-code\"` before the `model_list` format was introduced don't need to change anything."
+    },
+    {
+      "id": "chapter-10",
+      "label": "Factory Entrypoint",
+      "snippets": [
+        {
+          "filePath": "pkg/providers/legacy_provider.go",
+          "startLine": 18,
+          "endLine": 61,
+          "content": "func CreateProvider(cfg *config.Config) (LLMProvider, string, error) {\n\tmodel := cfg.Agents.Defaults.GetModelName()\n\n\t// Ensure model_list is populated from providers config if needed\n\t// This handles two cases:\n\t// 1. ModelList is empty - convert all providers\n\t// 2. ModelList has some entries but not all providers - merge missing ones\n\tif cfg.HasProvidersConfig() {\n\t\tproviderModels := config.ConvertProvidersToModelList(cfg)\n\t\texistingModelNames := make(map[string]bool)\n\t\tfor _, m := range cfg.ModelList {\n\t\t\texistingModelNames[m.ModelName] = true\n\t\t}\n\t\tfor _, pm := range providerModels {\n\t\t\tif !existingModelNames[pm.ModelName] {\n\t\t\t\tcfg.ModelList = append(cfg.ModelList, pm)\n\t\t\t}\n\t\t}\n\t}\n\n\t// Must have model_list at this point\n\tif len(cfg.ModelList) == 0 {\n\t\treturn nil, \"\", fmt.Errorf(\"no providers configured. Please add entries to model_list in your config\")\n\t}\n\n\t// Get model config from model_list\n\tmodelCfg, err := cfg.GetModelConfig(model)\n\tif err != nil {\n\t\treturn nil, \"\", fmt.Errorf(\"model %q not found in model_list: %w\", model, err)\n\t}\n\n\t// Inject global workspace if not set in model config\n\tif modelCfg.Workspace == \"\" {\n\t\tmodelCfg.Workspace = cfg.WorkspacePath()\n\t}\n\n\t// Use factory to create provider\n\tprovider, modelID, err := CreateProviderFromConfig(modelCfg)\n\tif err != nil {\n\t\treturn nil, \"\", fmt.Errorf(\"failed to create provider for model %q: %w\", model, err)\n\t}\n\n\treturn provider, modelID, nil\n}"
+        }
+      ],
+      "explanation": "`CreateProvider` at line 18 is the top-level function that orchestrates provider creation. It first merges any legacy provider configurations into the `model_list` (lines 25–36), ensuring backward compatibility. Then it looks up the model config (line 44), injects the global workspace if the model config doesn't specify one (lines 50–52), and delegates to `CreateProviderFromConfig` (line 55).\n\nWhat's elegant here is that by the time `CreateProviderFromConfig` is called, it doesn't matter whether the user configured via the old `providers` section or the new `model_list` — the code path converges. For a claude-cli setup, this function retrieves the `ModelConfig` with `Model: \"claude-cli/claude-sonnet-4.6\"`, extracts the protocol, and creates a `ClaudeCliProvider`. The entire chain from config file to executable subprocess is remarkably short."
+    },
+    {
+      "id": "chapter-11",
+      "label": "The Full Picture",
+      "snippets": [],
+      "explanation": "PicoClaw answers the Claude Code subscription question with a resounding yes, and the implementation is elegantly simple. The `ClaudeCliProvider` treats the `claude` binary as a black box — it feeds in prompts via stdin and reads structured JSON from stdout. No API keys, no OAuth flows, no token refresh logic. If `claude -p` works on your machine, PicoClaw can use it.\n\nThe architecture reveals a broader design philosophy: PicoClaw stays lightweight by delegating complexity outward. Rather than bundling authentication SDKs for every provider, it supports CLI-based providers that handle their own auth. This is particularly fitting for an agent designed to run on $10 hardware with <10MB RAM — every dependency avoided is memory saved.\n\nTo enable it, users add a `model_list` entry with protocol `\"claude-cli/\"` (or set `provider: \"claude-code\"` in legacy config). The factory chain routes through `ExtractProtocol`, matches the `claude-cli` case, and creates a `ClaudeCliProvider`. From there, every `Chat()` call spawns a `claude -p` subprocess, converts the JSON response, and extracts any tool calls. The result is a fully functional AI agent powered by your Claude Code subscription — no separate API key required."
+    }
+  ]
+}
