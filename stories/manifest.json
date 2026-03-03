@@ -1,6 +1,12 @@
 {
   "stories": [
     {
+      "id": "picoclaw-user-learning",
+      "title": "How PicoClaw Learns from User Interactions",
+      "commitHash": "4a7605ee14bff076ca77c8916c6bd59930224566",
+      "createdAt": "2026-03-03T12:00:00.000Z"
+    },
+    {
       "id": "picoclaw-telegram",
       "title": "Picoclaw's Native Telegram Integration",
       "commitHash": "435223f500b56b81c2c238c36109401ef5f1ba99",

@@ -1,0 +1,208 @@
+{
+  "id": "picoclaw-user-learning",
+  "title": "How PicoClaw Learns from User Interactions",
+  "query": "How does picoclaw learn from user interactions?",
+  "repo": "sipeed/picoclaw",
+  "commitHash": "4a7605ee14bff076ca77c8916c6bd59930224566",
+  "createdAt": "2026-03-03T12:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "Learning Overview",
+      "snippets": [],
+      "explanation": "Picoclaw is an ultra-lightweight AI agent designed to run on hardware as modest as a $10 single-board computer. Despite these constraints, it genuinely learns from user interactions — not through machine learning training, but through a layered system of file-based memory, conversation persistence, and LLM-directed self-updating.\n\nThe architecture rests on a few key concepts. The **system prompt** is the instruction text sent to the language model before each conversation turn — picoclaw assembles this from multiple files, including memory. **Tool calls** are actions the LLM can request (reading files, writing files, running commands), and critically, the LLM can write to its own memory files. The **context window** is the maximum amount of text the LLM can process at once, which drives the need for summarization. **Atomic writes** ensure that file updates either complete fully or not at all, preventing corruption on unreliable storage.\n\nThis story walks through each layer: how memory is structured, how it flows into the agent's prompt, how conversations persist across sessions, and how older context gets intelligently compressed to make room for new learning."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Memory Store",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/memory.go",
+          "startLine": 19,
+          "endLine": 42,
+          "content": "// MemoryStore manages persistent memory for the agent.\n// - Long-term memory: memory/MEMORY.md\n// - Daily notes: memory/YYYYMM/YYYYMMDD.md\ntype MemoryStore struct {\n\tworkspace  string\n\tmemoryDir  string\n\tmemoryFile string\n}\n\n// NewMemoryStore creates a new MemoryStore with the given workspace path.\n// It ensures the memory directory exists.\nfunc NewMemoryStore(workspace string) *MemoryStore {\n\tmemoryDir := filepath.Join(workspace, \"memory\")\n\tmemoryFile := filepath.Join(memoryDir, \"MEMORY.md\")\n\n\t// Ensure memory directory exists\n\tos.MkdirAll(memoryDir, 0o755)\n\n\treturn &MemoryStore{\n\t\tworkspace:  workspace,\n\t\tmemoryDir:  memoryDir,\n\t\tmemoryFile: memoryFile,\n\t}\n}"
+        }
+      ],
+      "explanation": "`MemoryStore` at line 22 is deceptively simple — just three string fields pointing to paths. But this simplicity is the design. The two-tier architecture separates **long-term memory** (a single `MEMORY.md` file for persistent facts like user preferences) from **daily notes** (date-organized files in `YYYYMM/YYYYMMDD.md` for ephemeral observations).\n\n`NewMemoryStore` on line 30 anchors everything to a workspace directory and eagerly creates the memory directory with `os.MkdirAll`. The choice to use a simple directory tree rather than a database reflects picoclaw's philosophy of running anywhere — including devices with no database engine. Lines 31-32 show the two paths that become the agent's filing cabinet: one stable address for what matters long-term, and a date-bucketed tree for daily context."
+    },
+    {
+      "id": "chapter-2",
+      "label": "Long-Term Memory",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/memory.go",
+          "startLine": 52,
+          "endLine": 66,
+          "content": "// ReadLongTerm reads the long-term memory (MEMORY.md).\n// Returns empty string if the file doesn't exist.\nfunc (ms *MemoryStore) ReadLongTerm() string {\n\tif data, err := os.ReadFile(ms.memoryFile); err == nil {\n\t\treturn string(data)\n\t}\n\treturn \"\"\n}\n\n// WriteLongTerm writes content to the long-term memory file (MEMORY.md).\nfunc (ms *MemoryStore) WriteLongTerm(content string) error {\n\t// Use unified atomic write utility with explicit sync for flash storage reliability.\n\t// Using 0o600 (owner read/write only) for secure default permissions.\n\treturn fileutil.WriteFileAtomic(ms.memoryFile, []byte(content), 0o600)\n}"
+        }
+      ],
+      "explanation": "Reading and writing long-term memory is as minimal as Go code gets. `ReadLongTerm` returns the file content or an empty string — no error propagation, because missing memory is a valid initial state. `WriteLongTerm` delegates to `fileutil.WriteFileAtomic` with `0o600` permissions (owner-only access), ensuring both durability on flash storage and basic security. The design choice to make memory a flat file means the LLM can rewrite it entirely, restructuring what it remembers as its understanding of the user evolves."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Daily Notes",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/memory.go",
+          "startLine": 78,
+          "endLine": 106,
+          "content": "// AppendToday appends content to today's daily note.\n// If the file doesn't exist, it creates a new file with a date header.\nfunc (ms *MemoryStore) AppendToday(content string) error {\n\ttodayFile := ms.getTodayFile()\n\n\t// Ensure month directory exists\n\tmonthDir := filepath.Dir(todayFile)\n\tif err := os.MkdirAll(monthDir, 0o755); err != nil {\n\t\treturn err\n\t}\n\n\tvar existingContent string\n\tif data, err := os.ReadFile(todayFile); err == nil {\n\t\texistingContent = string(data)\n\t}\n\n\tvar newContent string\n\tif existingContent == \"\" {\n\t\t// Add header for new day\n\t\theader := fmt.Sprintf(\"# %s\\n\\n\", time.Now().Format(\"2006-01-02\"))\n\t\tnewContent = header + content\n\t} else {\n\t\t// Append to existing content\n\t\tnewContent = existingContent + \"\\n\" + content\n\t}\n\n\t// Use unified atomic write utility with explicit sync for flash storage reliability.\n\treturn fileutil.WriteFileAtomic(todayFile, []byte(newContent), 0o600)\n}"
+        },
+        {
+          "filePath": "pkg/agent/memory.go",
+          "startLine": 108,
+          "endLine": 130,
+          "content": "// GetRecentDailyNotes returns daily notes from the last N days.\n// Contents are joined with \"---\" separator.\nfunc (ms *MemoryStore) GetRecentDailyNotes(days int) string {\n\tvar sb strings.Builder\n\tfirst := true\n\n\tfor i := range days {\n\t\tdate := time.Now().AddDate(0, 0, -i)\n\t\tdateStr := date.Format(\"20060102\") // YYYYMMDD\n\t\tmonthDir := dateStr[:6]            // YYYYMM\n\t\tfilePath := filepath.Join(ms.memoryDir, monthDir, dateStr+\".md\")\n\n\t\tif data, err := os.ReadFile(filePath); err == nil {\n\t\t\tif !first {\n\t\t\t\tsb.WriteString(\"\\n\\n---\\n\\n\")\n\t\t\t}\n\t\t\tsb.Write(data)\n\t\t\tfirst = false\n\t\t}\n\t}\n\n\treturn sb.String()\n}"
+        }
+      ],
+      "explanation": "Where long-term memory gets rewritten wholesale, daily notes take the opposite approach — they only grow. `AppendToday` starting at line 80 handles the ephemeral side of memory. Lines 83-87 ensure the month directory exists (creating `memory/202603/` on the fly), and lines 95-98 auto-generate a markdown date header the first time a note is written for a new day. The result is a structured diary that organizes itself by month.\n\n`GetRecentDailyNotes` at line 110 is the retrieval counterpart. It walks backward through the last N days, checking if a daily note file exists for each date. Lines 114-126 iterate through dates using Go's `AddDate` arithmetic, reading whichever files exist and joining them with `---` separators. Missing days are silently skipped — if the agent wasn't active on a day, there's simply nothing to recall. This graceful handling of gaps means the system never fails due to inactivity."
+    },
+    {
+      "id": "chapter-4",
+      "label": "Memory Assembly",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/memory.go",
+          "startLine": 132,
+          "endLine": 158,
+          "content": "// GetMemoryContext returns formatted memory context for the agent prompt.\n// Includes long-term memory and recent daily notes.\nfunc (ms *MemoryStore) GetMemoryContext() string {\n\tlongTerm := ms.ReadLongTerm()\n\trecentNotes := ms.GetRecentDailyNotes(3)\n\n\tif longTerm == \"\" && recentNotes == \"\" {\n\t\treturn \"\"\n\t}\n\n\tvar sb strings.Builder\n\n\tif longTerm != \"\" {\n\t\tsb.WriteString(\"## Long-term Memory\\n\\n\")\n\t\tsb.WriteString(longTerm)\n\t}\n\n\tif recentNotes != \"\" {\n\t\tif longTerm != \"\" {\n\t\t\tsb.WriteString(\"\\n\\n---\\n\\n\")\n\t\t}\n\t\tsb.WriteString(\"## Recent Daily Notes\\n\\n\")\n\t\tsb.WriteString(recentNotes)\n\t}\n\n\treturn sb.String()\n}"
+        }
+      ],
+      "explanation": "At line 134, both memory tiers converge into a single string for injection into the system prompt. Line 136 retrieves the last 3 days of daily notes — a hardcoded window that balances recency with token budget. The conditional formatting on lines 144-155 ensures clean markdown sections only appear when they have content. This function is deliberately stateless: it reads files, concatenates, returns. No caching here — that responsibility lives one layer up in the `ContextBuilder`."
+    },
+    {
+      "id": "chapter-5",
+      "label": "Bootstrap Identity",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/context.go",
+          "startLine": 69,
+          "endLine": 92,
+          "content": "func (cb *ContextBuilder) getIdentity() string {\n\tworkspacePath, _ := filepath.Abs(filepath.Join(cb.workspace))\n\n\treturn fmt.Sprintf(`# picoclaw 🦞\n\nYou are picoclaw, a helpful AI assistant.\n\n## Workspace\nYour workspace is at: %s\n- Memory: %s/memory/MEMORY.md\n- Daily Notes: %s/memory/YYYYMM/YYYYMMDD.md\n- Skills: %s/skills/{skill-name}/SKILL.md\n\n## Important Rules\n\n1. **ALWAYS use tools** - When you need to perform an action (schedule reminders, send messages, execute commands, etc.), you MUST call the appropriate tool. Do NOT just say you'll do it or pretend to do it.\n\n2. **Be helpful and accurate** - When using tools, briefly explain what you're doing.\n\n3. **Memory** - When interacting with me if something seems memorable, update %s/memory/MEMORY.md\n\n4. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,\n\t\tworkspacePath, workspacePath, workspacePath, workspacePath, workspacePath)\n}"
+        }
+      ],
+      "explanation": "The identity prompt constructed at line 69 tells the LLM who it is and how to behave. But the real learning magic is on line 88: `\"When interacting with me if something seems memorable, update memory/MEMORY.md\"`. This single instruction is what makes picoclaw a learning agent — it delegates the *decision* of what to remember to the LLM itself.\n\nThe prompt also maps out the workspace layout (lines 77-80), telling the LLM where its memory lives, where daily notes go, and where to find skills. Lines 84-86 establish the tool-use mandate, and line 90 adds an important guardrail: conversation summaries are \"approximate references only.\" This prevents the agent from treating compressed history as gospel, ensuring explicit user instructions always win over potentially lossy summaries."
+    },
+    {
+      "id": "chapter-6",
+      "label": "System Prompt",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/context.go",
+          "startLine": 94,
+          "endLine": 124,
+          "content": "func (cb *ContextBuilder) BuildSystemPrompt() string {\n\tparts := []string{}\n\n\t// Core identity section\n\tparts = append(parts, cb.getIdentity())\n\n\t// Bootstrap files\n\tbootstrapContent := cb.LoadBootstrapFiles()\n\tif bootstrapContent != \"\" {\n\t\tparts = append(parts, bootstrapContent)\n\t}\n\n\t// Skills - show summary, AI can read full content with read_file tool\n\tskillsSummary := cb.skillsLoader.BuildSkillsSummary()\n\tif skillsSummary != \"\" {\n\t\tparts = append(parts, fmt.Sprintf(`# Skills\n\nThe following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.\n\n%s`, skillsSummary))\n\t}\n\n\t// Memory context\n\tmemoryContext := cb.memory.GetMemoryContext()\n\tif memoryContext != \"\" {\n\t\tparts = append(parts, \"# Memory\\n\\n\"+memoryContext)\n\t}\n\n\t// Join with \"---\" separator\n\treturn strings.Join(parts, \"\\n\\n---\\n\\n\")\n}"
+        },
+        {
+          "filePath": "pkg/agent/context.go",
+          "startLine": 397,
+          "endLine": 414,
+          "content": "func (cb *ContextBuilder) LoadBootstrapFiles() string {\n\tbootstrapFiles := []string{\n\t\t\"AGENTS.md\",\n\t\t\"SOUL.md\",\n\t\t\"USER.md\",\n\t\t\"IDENTITY.md\",\n\t}\n\n\tvar sb strings.Builder\n\tfor _, filename := range bootstrapFiles {\n\t\tfilePath := filepath.Join(cb.workspace, filename)\n\t\tif data, err := os.ReadFile(filePath); err == nil {\n\t\t\tfmt.Fprintf(&sb, \"## %s\\n\\n%s\\n\\n\", filename, data)\n\t\t}\n\t}\n\n\treturn sb.String()\n}"
+        }
+      ],
+      "explanation": "`BuildSystemPrompt` at line 94 is where picoclaw's entire learned knowledge converges into a single string that the LLM will see. The assembly order matters: identity first (line 98), then bootstrap files (line 101), then skills (line 107), then memory (line 117). Each layer adds to the agent's working knowledge, and the `---` separators on line 123 give the LLM clear section boundaries.\n\n`LoadBootstrapFiles` at line 397 reveals the four personality files: `AGENTS.md` (behavioral instructions), `SOUL.md` (personality traits), `USER.md` (learned user preferences), and `IDENTITY.md` (self-description). These files can be edited both by the user manually and by the agent via file tools — meaning the agent can literally rewrite its own personality description or update its understanding of the user.\n\nThe interplay between lines 107-113 (skills) and lines 117-120 (memory) shows a deliberate layering. Skills provide capability descriptions as an XML summary, while memory provides the actual learned context. Together with the bootstrap files, this creates a system prompt that grows organically as the agent accumulates knowledge from interactions."
+    },
+    {
+      "id": "chapter-7",
+      "label": "Prompt Caching",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/context.go",
+          "startLine": 126,
+          "endLine": 159,
+          "content": "// BuildSystemPromptWithCache returns the cached system prompt if available\n// and source files haven't changed, otherwise builds and caches it.\n// Source file changes are detected via mtime checks (cheap stat calls).\nfunc (cb *ContextBuilder) BuildSystemPromptWithCache() string {\n\t// Try read lock first — fast path when cache is valid\n\tcb.systemPromptMutex.RLock()\n\tif cb.cachedSystemPrompt != \"\" && !cb.sourceFilesChangedLocked() {\n\t\tresult := cb.cachedSystemPrompt\n\t\tcb.systemPromptMutex.RUnlock()\n\t\treturn result\n\t}\n\tcb.systemPromptMutex.RUnlock()\n\n\t// Acquire write lock for building\n\tcb.systemPromptMutex.Lock()\n\tdefer cb.systemPromptMutex.Unlock()\n\n\t// Double-check: another goroutine may have rebuilt while we waited\n\tif cb.cachedSystemPrompt != \"\" && !cb.sourceFilesChangedLocked() {\n\t\treturn cb.cachedSystemPrompt\n\t}\n\n\t// Snapshot the baseline (existence + max mtime) BEFORE building the prompt.\n\t// This way cachedAt reflects the pre-build state: if a file is modified\n\t// during BuildSystemPrompt, its new mtime will be > baseline.maxMtime,\n\t// so the next sourceFilesChangedLocked check will correctly trigger a\n\t// rebuild. The alternative (baseline after build) risks caching stale\n\t// content with a too-new baseline, making the staleness invisible.\n\tbaseline := cb.buildCacheBaseline()\n\tprompt := cb.BuildSystemPrompt()\n\tcb.cachedSystemPrompt = prompt\n\tcb.cachedAt = baseline.maxMtime\n\tcb.existedAtCache = baseline.existed\n\tcb.skillFilesAtCache = baseline.skillFiles"
+        }
+      ],
+      "explanation": "Rebuilding the system prompt means reading multiple files from disk on every single message — a real performance problem. `BuildSystemPromptWithCache` at line 129 solves it with a read-write lock cache that auto-invalidates when source files change.\n\nLines 131-137 show the fast path: acquire a read lock, check the cache, return if valid. The key insight is `sourceFilesChangedLocked()` at line 132, which performs cheap `os.Stat` calls to check file modification times rather than re-reading file contents. When the agent writes to `MEMORY.md` via a tool call, the file's mtime changes, and the next cache check detects it automatically.\n\nLines 148-153 contain a subtle but important comment: the baseline snapshot is taken *before* building the prompt. If a file changes during the build, its new mtime will exceed the baseline, triggering a rebuild on the next request. The alternative — snapshotting after the build — could silently cache stale content. This careful ordering ensures learning is never lost in a race condition."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Session Persistence",
+      "snippets": [
+        {
+          "filePath": "pkg/session/manager.go",
+          "startLine": 14,
+          "endLine": 60,
+          "content": "type Session struct {\n\tKey      string              `json:\"key\"`\n\tMessages []providers.Message `json:\"messages\"`\n\tSummary  string              `json:\"summary,omitempty\"`\n\tCreated  time.Time           `json:\"created\"`\n\tUpdated  time.Time           `json:\"updated\"`\n}\n\ntype SessionManager struct {\n\tsessions map[string]*Session\n\tmu       sync.RWMutex\n\tstorage  string\n}\n\nfunc NewSessionManager(storage string) *SessionManager {\n\tsm := &SessionManager{\n\t\tsessions: make(map[string]*Session),\n\t\tstorage:  storage,\n\t}\n\n\tif storage != \"\" {\n\t\tos.MkdirAll(storage, 0o755)\n\t\tsm.loadSessions()\n\t}\n\n\treturn sm\n}\n\nfunc (sm *SessionManager) GetOrCreate(key string) *Session {\n\tsm.mu.Lock()\n\tdefer sm.mu.Unlock()\n\n\tsession, ok := sm.sessions[key]\n\tif ok {\n\t\treturn session\n\t}\n\n\tsession = &Session{\n\t\tKey:      key,\n\t\tMessages: []providers.Message{},\n\t\tCreated:  time.Now(),\n\t\tUpdated:  time.Now(),\n\t}\n\tsm.sessions[key] = session\n\n\treturn session\n}"
+        }
+      ],
+      "explanation": "The `Session` struct at line 14 holds the complete conversation state: message history, an optional summary, and timestamps. The `Summary` field on line 17 is where compressed older context lives after summarization — it's the bridge between short-term conversation memory and long-term recall.\n\n`SessionManager` at line 22 maps session keys to sessions in memory, with an optional storage directory for JSON persistence. `GetOrCreate` at line 42 implements lazy initialization — sessions spring into existence on first contact with a given key. Lines 51-56 show a fresh session starting with an empty message array and current timestamps. This design means every channel-chat combination gets its own isolated conversation thread, enabling picoclaw to learn different things from different users on different platforms simultaneously."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Agent Loop",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/loop.go",
+          "startLine": 573,
+          "endLine": 578,
+          "content": "// runAgentLoop is the core message processing logic.\nfunc (al *AgentLoop) runAgentLoop(\n\tctx context.Context,\n\tagent *AgentInstance,\n\topts processOptions,\n) (string, error) {"
+        },
+        {
+          "filePath": "pkg/agent/loop.go",
+          "startLine": 597,
+          "endLine": 641,
+          "content": "\t// 2. Build messages (skip history for heartbeat)\n\tvar history []providers.Message\n\tvar summary string\n\tif !opts.NoHistory {\n\t\thistory = agent.Sessions.GetHistory(opts.SessionKey)\n\t\tsummary = agent.Sessions.GetSummary(opts.SessionKey)\n\t}\n\tmessages := agent.ContextBuilder.BuildMessages(\n\t\thistory,\n\t\tsummary,\n\t\topts.UserMessage,\n\t\topts.Media,\n\t\topts.Channel,\n\t\topts.ChatID,\n\t)\n\n\t// Resolve media:// refs to base64 data URLs (streaming)\n\tmaxMediaSize := al.cfg.Agents.Defaults.GetMaxMediaSize()\n\tmessages = resolveMediaRefs(messages, al.mediaStore, maxMediaSize)\n\n\t// 3. Save user message to session\n\tagent.Sessions.AddMessage(opts.SessionKey, \"user\", opts.UserMessage)\n\n\t// 4. Run LLM iteration loop\n\tfinalContent, iteration, err := al.runLLMIteration(ctx, agent, messages, opts)\n\tif err != nil {\n\t\treturn \"\", err\n\t}\n\n\t// If last tool had ForUser content and we already sent it, we might not need to send final response\n\t// This is controlled by the tool's Silent flag and ForUser content\n\n\t// 5. Handle empty response\n\tif finalContent == \"\" {\n\t\tfinalContent = opts.DefaultResponse\n\t}\n\n\t// 6. Save final assistant message to session\n\tagent.Sessions.AddMessage(opts.SessionKey, \"assistant\", finalContent)\n\tagent.Sessions.Save(opts.SessionKey)\n\n\t// 7. Optional: summarization\n\tif opts.EnableSummary {\n\t\tal.maybeSummarize(agent, opts.SessionKey, opts.Channel, opts.ChatID)\n\t}"
+        }
+      ],
+      "explanation": "`runAgentLoop` is the heartbeat of picoclaw's learning cycle. The first snippet (lines 573-578) shows its signature: it takes an agent instance and processing options, returning a response string or error. The second snippet walks through the numbered steps where learning takes shape.\n\nSteps 2-3 (lines 597-618) load the existing session state — both raw message history and any previously compressed summary — then build the full message array using `ContextBuilder.BuildMessages`. This is where all accumulated knowledge (memory, identity, skills, past conversations) gets assembled into what the LLM actually sees. The user's new message is immediately saved to the session on line 618, between these two snippets the function also handles channel recording and tool context updates.\n\nStep 4 (line 621) runs the LLM iteration loop, which may execute tool calls — including writing to memory files. Steps 5-6 (lines 630-636) save the assistant's response back to the session and persist it to disk. Step 7 (lines 639-641) is where the cycle closes: `maybeSummarize` checks whether the conversation has grown large enough to warrant compression. This create-respond-save-compress rhythm keeps the agent learning without exhausting its context window."
+    },
+    {
+      "id": "chapter-10",
+      "label": "Summary Trigger",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/loop.go",
+          "startLine": 1080,
+          "endLine": 1096,
+          "content": "// maybeSummarize triggers summarization if the session history exceeds thresholds.\nfunc (al *AgentLoop) maybeSummarize(agent *AgentInstance, sessionKey, channel, chatID string) {\n\tnewHistory := agent.Sessions.GetHistory(sessionKey)\n\ttokenEstimate := al.estimateTokens(newHistory)\n\tthreshold := agent.ContextWindow * 75 / 100\n\n\tif len(newHistory) > 20 || tokenEstimate > threshold {\n\t\tsummarizeKey := agent.ID + \":\" + sessionKey\n\t\tif _, loading := al.summarizing.LoadOrStore(summarizeKey, true); !loading {\n\t\t\tgo func() {\n\t\t\t\tdefer al.summarizing.Delete(summarizeKey)\n\t\t\t\tlogger.Debug(\"Memory threshold reached. Optimizing conversation history...\")\n\t\t\t\tal.summarizeSession(agent, sessionKey)\n\t\t\t}()\n\t\t}\n\t}\n}"
+        },
+        {
+          "filePath": "pkg/agent/loop.go",
+          "startLine": 1359,
+          "endLine": 1369,
+          "content": "// estimateTokens estimates the number of tokens in a message list.\n// Uses a safe heuristic of 2.5 characters per token to account for CJK and other\n// overheads better than the previous 3 chars/token.\nfunc (al *AgentLoop) estimateTokens(messages []providers.Message) int {\n\ttotalChars := 0\n\tfor _, m := range messages {\n\t\ttotalChars += utf8.RuneCountInString(m.Content)\n\t}\n\t// 2.5 chars per token = totalChars * 2 / 5\n\treturn totalChars * 2 / 5\n}"
+        }
+      ],
+      "explanation": "When does conversation history need compression? `maybeSummarize` at line 1081 decides. Two conditions trigger it (line 1086): more than 20 messages, or an estimated token count exceeding 75% of the context window. The 75% threshold at line 1084 leaves headroom for the next user message, system prompt, and tool results.\n\n`estimateTokens` at line 1362 uses a heuristic of 2.5 characters per token (calculated as `totalChars * 2 / 5` on line 1368). The comment notes this accounts for CJK text better than a simpler ratio. Notably, it counts Unicode runes via `utf8.RuneCountInString` rather than byte length — a detail that matters for picoclaw's multilingual user base.\n\nThe `sync.Map` check on line 1088 with `LoadOrStore` prevents duplicate summarization goroutines for the same session, and the `go func()` on line 1089 ensures summarization never blocks the user's response."
+    },
+    {
+      "id": "chapter-11",
+      "label": "Summarization",
+      "snippets": [
+        {
+          "filePath": "pkg/agent/loop.go",
+          "startLine": 1239,
+          "endLine": 1272,
+          "content": "func (al *AgentLoop) summarizeSession(agent *AgentInstance, sessionKey string) {\n\tctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)\n\tdefer cancel()\n\n\thistory := agent.Sessions.GetHistory(sessionKey)\n\tsummary := agent.Sessions.GetSummary(sessionKey)\n\n\t// Keep last 4 messages for continuity\n\tif len(history) <= 4 {\n\t\treturn\n\t}\n\n\ttoSummarize := history[:len(history)-4]\n\n\t// Oversized Message Guard\n\tmaxMessageTokens := agent.ContextWindow / 2\n\tvalidMessages := make([]providers.Message, 0)\n\tomitted := false\n\n\tfor _, m := range toSummarize {\n\t\tif m.Role != \"user\" && m.Role != \"assistant\" {\n\t\t\tcontinue\n\t\t}\n\t\tmsgTokens := len(m.Content) / 2\n\t\tif msgTokens > maxMessageTokens {\n\t\t\tomitted = true\n\t\t\tcontinue\n\t\t}\n\t\tvalidMessages = append(validMessages, m)\n\t}\n\n\tif len(validMessages) == 0 {\n\t\treturn\n\t}"
+        },
+        {
+          "filePath": "pkg/agent/loop.go",
+          "startLine": 1274,
+          "endLine": 1318,
+          "content": "\t// Multi-Part Summarization\n\tvar finalSummary string\n\tif len(validMessages) > 10 {\n\t\tmid := len(validMessages) / 2\n\t\tpart1 := validMessages[:mid]\n\t\tpart2 := validMessages[mid:]\n\n\t\ts1, _ := al.summarizeBatch(ctx, agent, part1, \"\")\n\t\ts2, _ := al.summarizeBatch(ctx, agent, part2, \"\")\n\n\t\tmergePrompt := fmt.Sprintf(\n\t\t\t\"Merge these two conversation summaries into one cohesive summary:\\n\\n1: %s\\n\\n2: %s\",\n\t\t\ts1,\n\t\t\ts2,\n\t\t)\n\t\tresp, err := agent.Provider.Chat(\n\t\t\tctx,\n\t\t\t[]providers.Message{{Role: \"user\", Content: mergePrompt}},\n\t\t\tnil,\n\t\t\tagent.Model,\n\t\t\tmap[string]any{\n\t\t\t\t\"max_tokens\":       1024,\n\t\t\t\t\"temperature\":      0.3,\n\t\t\t\t\"prompt_cache_key\": agent.ID,\n\t\t\t},\n\t\t)\n\t\tif err == nil {\n\t\t\tfinalSummary = resp.Content\n\t\t} else {\n\t\t\tfinalSummary = s1 + \" \" + s2\n\t\t}\n\t} else {\n\t\tfinalSummary, _ = al.summarizeBatch(ctx, agent, validMessages, summary)\n\t}\n\n\tif omitted && finalSummary != \"\" {\n\t\tfinalSummary += \"\\n[Note: Some oversized messages were omitted from this summary for efficiency.]\"\n\t}\n\n\tif finalSummary != \"\" {\n\t\tagent.Sessions.SetSummary(sessionKey, finalSummary)\n\t\tagent.Sessions.TruncateHistory(sessionKey, 4)\n\t\tagent.Sessions.Save(sessionKey)\n\t}\n}"
+        }
+      ],
+      "explanation": "`summarizeSession` is where picoclaw distills accumulated conversation knowledge into a compact summary. Lines 1243-1244 load the full history and any existing summary, then line 1247 applies the \"keep last 4\" rule — recent messages stay intact for conversational continuity, while everything older gets summarized.\n\nLines 1253-1268 form an \"oversized message guard\" that filters out individual messages larger than half the context window. Only user and assistant messages are considered (line 1259 skips tool results), and oversized ones are silently omitted to prevent the summarization call itself from hitting context limits.\n\nThe multi-part strategy starting at line 1276 handles large histories by splitting at the midpoint, summarizing each half independently via `summarizeBatch`, then merging with another LLM call (lines 1284-1304). The merge prompt on line 1285 asks for \"one cohesive summary,\" and if that merge call fails, line 1303 gracefully falls back to simple concatenation. For smaller histories, line 1306 takes a simpler single-batch path.\n\nThe critical save on lines 1313-1317 atomically updates the session: storing the new summary, truncating history to just the last 4 messages, and persisting to disk. This is the moment where ephemeral conversation becomes durable context — the agent's short-term memory crystallizes into a reusable summary."
+    },
+    {
+      "id": "chapter-12",
+      "label": "Atomic Writes",
+      "snippets": [
+        {
+          "filePath": "pkg/fileutil/file.go",
+          "startLine": 52,
+          "endLine": 119,
+          "content": "func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {\n\tdir := filepath.Dir(path)\n\tif err := os.MkdirAll(dir, 0o755); err != nil {\n\t\treturn fmt.Errorf(\"failed to create directory: %w\", err)\n\t}\n\n\t// Create temp file in the same directory (ensures atomic rename works)\n\t// Using a hidden prefix (.tmp-) to avoid issues with some tools\n\ttmpFile, err := os.OpenFile(\n\t\tfilepath.Join(dir, fmt.Sprintf(\".tmp-%d-%d\", os.Getpid(), time.Now().UnixNano())),\n\t\tos.O_WRONLY|os.O_CREATE|os.O_EXCL,\n\t\tperm,\n\t)\n\tif err != nil {\n\t\treturn fmt.Errorf(\"failed to create temp file: %w\", err)\n\t}\n\n\ttmpPath := tmpFile.Name()\n\tcleanup := true\n\n\tdefer func() {\n\t\tif cleanup {\n\t\t\ttmpFile.Close()\n\t\t\t_ = os.Remove(tmpPath)\n\t\t}\n\t}()\n\n\t// Write data to temp file\n\t// Note: Original file is untouched at this point\n\tif _, err := tmpFile.Write(data); err != nil {\n\t\treturn fmt.Errorf(\"failed to write temp file: %w\", err)\n\t}\n\n\t// CRITICAL: Force sync to storage medium before any other operations.\n\t// This ensures data is physically written to disk, not just cached.\n\t// Essential for SD cards, eMMC, and other flash storage on edge devices.\n\tif err := tmpFile.Sync(); err != nil {\n\t\treturn fmt.Errorf(\"failed to sync temp file: %w\", err)\n\t}\n\n\t// Set file permissions before closing\n\tif err := tmpFile.Chmod(perm); err != nil {\n\t\treturn fmt.Errorf(\"failed to set permissions: %w\", err)\n\t}\n\n\t// Close file before rename (required on Windows)\n\tif err := tmpFile.Close(); err != nil {\n\t\treturn fmt.Errorf(\"failed to close temp file: %w\", err)\n\t}\n\n\t// Atomic rename: temp file becomes the target\n\t// On POSIX: rename() is atomic\n\t// On Windows: Rename() is atomic for files\n\tif err := os.Rename(tmpPath, path); err != nil {\n\t\treturn fmt.Errorf(\"failed to rename temp file: %w\", err)\n\t}\n\n\t// Sync directory to ensure rename is durable\n\t// This prevents the renamed file from disappearing after a crash\n\tif dirFile, err := os.Open(dir); err == nil {\n\t\t_ = dirFile.Sync()\n\t\tdirFile.Close()\n\t}\n\n\t// Success: skip cleanup (file was renamed, no temp to remove)\n\tcleanup = false\n\treturn nil\n}"
+        }
+      ],
+      "explanation": "`WriteFileAtomic` is the safety net ensuring picoclaw's learned memories survive power failures. Lines 60-64 create a temp file in the same directory as the target — same-directory is critical because `os.Rename` is only atomic within a single filesystem. The `cleanup` flag and deferred function at lines 70-77 guarantee the temp file is removed on any error path.\n\nLine 88 is the most important: `tmpFile.Sync()` forces data from OS buffers to physical storage. The comment at line 87 explains why — SD cards and eMMC on edge devices cache writes aggressively. Lines 105-107 perform the atomic rename, and lines 111-113 sync the directory itself, preventing the rename from being lost after a crash. Every memory write in picoclaw flows through this function."
+    },
+    {
+      "id": "chapter-13",
+      "label": "Learning Recap",
+      "snippets": [],
+      "explanation": "Picoclaw's learning system is a cascade of complementary mechanisms, each addressing a different timescale and storage need. At the foundation, the `MemoryStore` provides two-tier persistent storage: long-term memory for stable facts and daily notes for ephemeral observations. Both tiers use atomic writes to survive the harsh realities of flash storage on minimal hardware.\n\nAbove the storage layer, the `ContextBuilder` assembles everything the agent knows — identity files, personality traits, user preferences, skills, and memory — into a system prompt that's cached for performance but automatically invalidated when any source file changes. The session manager adds conversation continuity, persisting full message histories to disk and enabling the agent to pick up where it left off.\n\nThe agent loop ties it all together with a create-respond-save-compress rhythm. Each interaction is saved, and when history grows too large, the summarization engine distills it into a compact summary that preserves key insights while freeing context window space for new learning. The LLM itself decides what's worth remembering, guided by a single prompt instruction to update its memory file when something seems memorable.\n\nWhat makes this design compelling is its simplicity. There's no vector database, no embedding pipeline, no fine-tuning — just markdown files, a good prompt, and an LLM that takes the instruction to remember seriously. It's learning that fits in 10 megabytes."
+    }
+  ]
+}
