@@ -1,0 +1,177 @@
+{
+  "id": "nanobot-learning",
+  "title": "How Nanobot Learns: From Conversations to Persistent Memory",
+  "query": "How does Nanobot learn from user interactions? Go deep into the learning system — how does it collect feedback, store interaction data, and improve over time?",
+  "repo": "HKUDS/nanobot",
+  "commitHash": "1303cc66690fd9597c6a5e13022f692dbb6a85a1",
+  "createdAt": "2026-03-04T12:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "The Learning Loop",
+      "snippets": [],
+      "explanation": "Nanobot doesn't learn through fine-tuning or weight updates. Instead, it builds a persistent memory from every conversation, feeding accumulated knowledge back into its own prompts. The result is an agent that genuinely gets more useful the longer you use it.\n\nThe learning system has four stages. First, every user message is **captured** as a structured event flowing through an async message bus. Second, these messages are **stored** in append-only session files — one per conversation — that grow over time. Third, when sessions get long enough, an LLM-driven **consolidation** process distills the conversation into two memory files: `MEMORY.md` (a living document of current facts) and `HISTORY.md` (a chronological log). Fourth, on every new interaction, the contents of `MEMORY.md` are **injected** directly into the system prompt, making the agent aware of everything it has learned.\n\nA few key terms to keep in mind: a **session** is a conversation tied to a specific channel and chat ID. The **memory window** controls how many recent messages the agent sees and when consolidation triggers. And **consolidation** is the LLM-powered process that converts raw conversation into structured memory."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Capturing Interactions",
+      "snippets": [
+        {
+          "filePath": "nanobot/bus/events.py",
+          "startLine": 8,
+          "endLine": 24,
+          "content": "@dataclass\nclass InboundMessage:\n    \"\"\"Message received from a chat channel.\"\"\"\n\n    channel: str  # telegram, discord, slack, whatsapp\n    sender_id: str  # User identifier\n    chat_id: str  # Chat/channel identifier\n    content: str  # Message text\n    timestamp: datetime = field(default_factory=datetime.now)\n    media: list[str] = field(default_factory=list)  # Media URLs\n    metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data\n    session_key_override: str | None = None  # Optional override for thread-scoped sessions\n\n    @property\n    def session_key(self) -> str:\n        \"\"\"Unique key for session identification.\"\"\"\n        return self.session_key_override or f\"{self.channel}:{self.chat_id}\""
+        }
+      ],
+      "explanation": "`InboundMessage` is the entry point for every user interaction. Each message carries a `channel` (like \"telegram\" or \"discord\"), a `sender_id`, a `chat_id`, and the actual `content`. The `session_key` property at line 22 is particularly important — it combines channel and chat_id into a unique identifier like `\"telegram:12345\"`, which becomes the key for all session storage and memory operations.\n\nThis design means Nanobot automatically maintains separate learning contexts per conversation. A Slack thread and a Telegram chat each accumulate their own distinct memories, with no cross-contamination."
+    },
+    {
+      "id": "chapter-2",
+      "label": "Session Data Model",
+      "snippets": [
+        {
+          "filePath": "nanobot/session/manager.py",
+          "startLine": 15,
+          "endLine": 43,
+          "content": "@dataclass\nclass Session:\n    \"\"\"\n    A conversation session.\n\n    Stores messages in JSONL format for easy reading and persistence.\n\n    Important: Messages are append-only for LLM cache efficiency.\n    The consolidation process writes summaries to MEMORY.md/HISTORY.md\n    but does NOT modify the messages list or get_history() output.\n    \"\"\"\n\n    key: str  # channel:chat_id\n    messages: list[dict[str, Any]] = field(default_factory=list)\n    created_at: datetime = field(default_factory=datetime.now)\n    updated_at: datetime = field(default_factory=datetime.now)\n    metadata: dict[str, Any] = field(default_factory=dict)\n    last_consolidated: int = 0  # Number of messages already consolidated to files\n\n    def add_message(self, role: str, content: str, **kwargs: Any) -> None:\n        \"\"\"Add a message to the session.\"\"\"\n        msg = {\n            \"role\": role,\n            \"content\": content,\n            \"timestamp\": datetime.now().isoformat(),\n            **kwargs\n        }\n        self.messages.append(msg)\n        self.updated_at = datetime.now()"
+        },
+        {
+          "filePath": "nanobot/session/manager.py",
+          "startLine": 45,
+          "endLine": 63,
+          "content": "    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:\n        \"\"\"Return unconsolidated messages for LLM input, aligned to a user turn.\"\"\"\n        unconsolidated = self.messages[self.last_consolidated:]\n        sliced = unconsolidated[-max_messages:]\n\n        # Drop leading non-user messages to avoid orphaned tool_result blocks\n        for i, m in enumerate(sliced):\n            if m.get(\"role\") == \"user\":\n                sliced = sliced[i:]\n                break\n\n        out: list[dict[str, Any]] = []\n        for m in sliced:\n            entry: dict[str, Any] = {\"role\": m[\"role\"], \"content\": m.get(\"content\", \"\")}\n            for k in (\"tool_calls\", \"tool_call_id\", \"name\"):\n                if k in m:\n                    entry[k] = m[k]\n            out.append(entry)\n        return out"
+        }
+      ],
+      "explanation": "The `Session` dataclass is where interaction data lives in memory. The docstring on lines 17-25 explicitly states that messages are **append-only for LLM cache efficiency**. This is a deliberate architectural choice: since many LLM providers cache prompt prefixes, keeping the message list immutable means earlier parts of the conversation can be served from cache rather than reprocessed.\n\nThe fields on lines 27-32 tell the story. `key` identifies the conversation, `messages` is the growing list of exchanges, and `last_consolidated` is a cursor tracking how far the memory consolidation process has progressed through the message history. This cursor is what prevents the same messages from being processed twice.\n\n`add_message` (line 34) does exactly what you'd expect — it appends a timestamped entry and updates `updated_at`. No deletions, no modifications.\n\nThe real cleverness is in `get_history` (line 45). It returns only unconsolidated messages (line 47), sliced to `max_messages`. Lines 51-54 ensure the returned history starts with a user message, preventing orphaned tool results from confusing the LLM. This method is what the agent loop calls when building context, so its output directly shapes what the agent \"remembers\" in the short term."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Session Persistence",
+      "snippets": [
+        {
+          "filePath": "nanobot/session/manager.py",
+          "startLine": 130,
+          "endLine": 157,
+          "content": "        try:\n            messages = []\n            metadata = {}\n            created_at = None\n            last_consolidated = 0\n\n            with open(path, encoding=\"utf-8\") as f:\n                for line in f:\n                    line = line.strip()\n                    if not line:\n                        continue\n\n                    data = json.loads(line)\n\n                    if data.get(\"_type\") == \"metadata\":\n                        metadata = data.get(\"metadata\", {})\n                        created_at = datetime.fromisoformat(data[\"created_at\"]) if data.get(\"created_at\") else None\n                        last_consolidated = data.get(\"last_consolidated\", 0)\n                    else:\n                        messages.append(data)\n\n            return Session(\n                key=key,\n                messages=messages,\n                created_at=created_at or datetime.now(),\n                metadata=metadata,\n                last_consolidated=last_consolidated\n            )"
+        },
+        {
+          "filePath": "nanobot/session/manager.py",
+          "startLine": 162,
+          "endLine": 179,
+          "content": "    def save(self, session: Session) -> None:\n        \"\"\"Save a session to disk.\"\"\"\n        path = self._get_session_path(session.key)\n\n        with open(path, \"w\", encoding=\"utf-8\") as f:\n            metadata_line = {\n                \"_type\": \"metadata\",\n                \"key\": session.key,\n                \"created_at\": session.created_at.isoformat(),\n                \"updated_at\": session.updated_at.isoformat(),\n                \"metadata\": session.metadata,\n                \"last_consolidated\": session.last_consolidated\n            }\n            f.write(json.dumps(metadata_line, ensure_ascii=False) + \"\\n\")\n            for msg in session.messages:\n                f.write(json.dumps(msg, ensure_ascii=False) + \"\\n\")\n\n        self._cache[session.key] = session"
+        }
+      ],
+      "explanation": "Sessions survive restarts thanks to JSONL (JSON Lines) files — one JSON object per line. The `_load` method starting at line 130 reads these files line by line. The first line with `_type: \"metadata\"` carries the session's creation time, metadata, and crucially the `last_consolidated` cursor (line 147). Every subsequent line is a message that gets appended to the messages list.\n\nThe `save` method at line 162 writes the session back. It starts with the metadata line (lines 167-174), including `last_consolidated`, then dumps every message as a separate JSON line. The format is human-readable — you can literally `cat` a session file and follow the conversation.\n\nOne subtle but important detail: `last_consolidated` is persisted alongside the messages (line 173). This means that if Nanobot restarts mid-conversation, it knows exactly which messages have already been distilled into memory and which haven't. Without this, the agent would either re-consolidate old messages or miss new ones entirely."
+    },
+    {
+      "id": "chapter-4",
+      "label": "Saving Each Turn",
+      "snippets": [
+        {
+          "filePath": "nanobot/agent/loop.py",
+          "startLine": 455,
+          "endLine": 488,
+          "content": "    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:\n        \"\"\"Save new-turn messages into session, truncating large tool results.\"\"\"\n        from datetime import datetime\n        for m in messages[skip:]:\n            entry = dict(m)\n            role, content = entry.get(\"role\"), entry.get(\"content\")\n            if role == \"assistant\" and not content and not entry.get(\"tool_calls\"):\n                continue  # skip empty assistant messages — they poison session context\n            if role == \"tool\" and isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:\n                entry[\"content\"] = content[:self._TOOL_RESULT_MAX_CHARS] + \"\\n... (truncated)\"\n            elif role == \"user\":\n                if isinstance(content, str) and content.startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):\n                    # Strip the runtime-context prefix, keep only the user text.\n                    parts = content.split(\"\\n\\n\", 1)\n                    if len(parts) > 1 and parts[1].strip():\n                        entry[\"content\"] = parts[1]\n                    else:\n                        continue\n                if isinstance(content, list):\n                    filtered = []\n                    for c in content:\n                        if c.get(\"type\") == \"text\" and isinstance(c.get(\"text\"), str) and c[\"text\"].startswith(ContextBuilder._RUNTIME_CONTEXT_TAG):\n                            continue  # Strip runtime context from multimodal messages\n                        if (c.get(\"type\") == \"image_url\"\n                                and c.get(\"image_url\", {}).get(\"url\", \"\").startswith(\"data:image/\")):\n                            filtered.append({\"type\": \"text\", \"text\": \"[image]\"})\n                        else:\n                            filtered.append(c)\n                    if not filtered:\n                        continue\n                    entry[\"content\"] = filtered\n            entry.setdefault(\"timestamp\", datetime.now().isoformat())\n            session.messages.append(entry)\n        session.updated_at = datetime.now()"
+        }
+      ],
+      "explanation": "`_save_turn` is the bridge between the agent loop and session storage. After each interaction — LLM call, tool executions, and final response — this method extracts the new messages and appends them to the session.\n\nThe method iterates over `messages[skip:]` (line 458), where `skip` accounts for the system prompt and history already in the session. Each message gets filtered through several rules. Line 461 skips empty assistant messages that would \"poison\" the session context. Line 463 truncates tool results longer than 500 characters — the full output already served its purpose during the agent's reasoning, so only a summary needs to be stored.\n\nThe user message handling (lines 465-485) is particularly careful. Lines 466-472 strip the runtime context metadata (timestamps, channel info) that gets prepended to each user message during context building — this ephemeral data shouldn't be stored permanently. Lines 473-485 handle multimodal messages: base64-encoded images get replaced with a compact `[image]` placeholder, keeping session files from ballooning in size.\n\nEvery surviving entry gets a timestamp (line 486) and is appended to `session.messages` (line 487). This append-only discipline, combined with the consolidation cursor, is what makes the entire learning pipeline work."
+    },
+    {
+      "id": "chapter-5",
+      "label": "Two-Layer Memory",
+      "snippets": [
+        {
+          "filePath": "nanobot/agent/memory.py",
+          "startLine": 45,
+          "endLine": 67,
+          "content": "class MemoryStore:\n    \"\"\"Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log).\"\"\"\n\n    def __init__(self, workspace: Path):\n        self.memory_dir = ensure_dir(workspace / \"memory\")\n        self.memory_file = self.memory_dir / \"MEMORY.md\"\n        self.history_file = self.memory_dir / \"HISTORY.md\"\n\n    def read_long_term(self) -> str:\n        if self.memory_file.exists():\n            return self.memory_file.read_text(encoding=\"utf-8\")\n        return \"\"\n\n    def write_long_term(self, content: str) -> None:\n        self.memory_file.write_text(content, encoding=\"utf-8\")\n\n    def append_history(self, entry: str) -> None:\n        with open(self.history_file, \"a\", encoding=\"utf-8\") as f:\n            f.write(entry.rstrip() + \"\\n\\n\")\n\n    def get_memory_context(self) -> str:\n        long_term = self.read_long_term()\n        return f\"## Long-term Memory\\n{long_term}\" if long_term else \"\""
+        }
+      ],
+      "explanation": "`MemoryStore` manages the two files that consolidation produces. The constructor (lines 48-51) creates paths for `MEMORY.md` and `HISTORY.md` inside a `memory/` subdirectory of the workspace.\n\nThe methods are intentionally asymmetric. `read_long_term` and `write_long_term` (lines 53-59) handle MEMORY.md as a document that gets fully replaced each time — it's a living snapshot of the agent's current knowledge. `append_history` (lines 61-63) only adds to HISTORY.md, never overwrites. This gives you a grep-searchable chronological record of past interactions.\n\n`get_memory_context` at line 65 is the read interface that the context builder calls. It wraps the contents of MEMORY.md in a markdown header, ready to be inserted into the system prompt. If the file is empty, it returns nothing — a fresh agent starts without preconceptions."
+    },
+    {
+      "id": "chapter-6",
+      "label": "save_memory Tool",
+      "snippets": [
+        {
+          "filePath": "nanobot/agent/memory.py",
+          "startLine": 18,
+          "endLine": 42,
+          "content": "_SAVE_MEMORY_TOOL = [\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"save_memory\",\n            \"description\": \"Save the memory consolidation result to persistent storage.\",\n            \"parameters\": {\n                \"type\": \"object\",\n                \"properties\": {\n                    \"history_entry\": {\n                        \"type\": \"string\",\n                        \"description\": \"A paragraph (2-5 sentences) summarizing key events/decisions/topics. \"\n                        \"Start with [YYYY-MM-DD HH:MM]. Include detail useful for grep search.\",\n                    },\n                    \"memory_update\": {\n                        \"type\": \"string\",\n                        \"description\": \"Full updated long-term memory as markdown. Include all existing \"\n                        \"facts plus new ones. Return unchanged if nothing new.\",\n                    },\n                },\n                \"required\": [\"history_entry\", \"memory_update\"],\n            },\n        },\n    }\n]"
+        }
+      ],
+      "explanation": "Rather than parsing free-text from the consolidation LLM, Nanobot defines `_SAVE_MEMORY_TOOL` as a virtual function-calling schema. This is a clever technique: it uses the LLM's tool-calling capability not to trigger an action, but to enforce structured output.\n\nThe tool has two required parameters. `history_entry` (lines 27-31) must be a timestamped paragraph suitable for grep searches — the description even specifies starting with `[YYYY-MM-DD HH:MM]`. `memory_update` (lines 32-36) is the full updated MEMORY.md content, including all existing facts plus any new ones.\n\nBy requiring `memory_update` to return the *complete* document rather than a diff, Nanobot avoids merge conflicts entirely. The LLM sees the current memory, decides what to keep, add, or revise, and returns the whole thing. Simple and robust."
+    },
+    {
+      "id": "chapter-7",
+      "label": "LLM Consolidation",
+      "snippets": [
+        {
+          "filePath": "nanobot/agent/memory.py",
+          "startLine": 97,
+          "endLine": 121,
+          "content": "        lines = []\n        for m in old_messages:\n            if not m.get(\"content\"):\n                continue\n            tools = f\" [tools: {', '.join(m['tools_used'])}]\" if m.get(\"tools_used\") else \"\"\n            lines.append(f\"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}\")\n\n        current_memory = self.read_long_term()\n        prompt = f\"\"\"Process this conversation and call the save_memory tool with your consolidation.\n\n## Current Long-term Memory\n{current_memory or \"(empty)\"}\n\n## Conversation to Process\n{chr(10).join(lines)}\"\"\"\n\n        try:\n            response = await provider.chat(\n                messages=[\n                    {\"role\": \"system\", \"content\": \"You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.\"},\n                    {\"role\": \"user\", \"content\": prompt},\n                ],\n                tools=_SAVE_MEMORY_TOOL,\n                model=model,\n            )"
+        }
+      ],
+      "explanation": "Here's where learning actually happens. The `consolidate` method (starting at line 69, not shown) first selects which messages to process — everything between `last_consolidated` and a sliding window boundary. This snippet picks up at the formatting stage.\n\nLines 97-102 transform raw messages into a concise text format: `[timestamp] ROLE [tools: ...]: content`. Each message becomes a single line with its timestamp trimmed to 16 characters and the role uppercased. If a message used tools, those are noted in brackets. This formatting strips away protocol noise and gives the consolidation LLM a clean, readable transcript.\n\nLines 104-111 build the prompt. The LLM receives both the current long-term memory (which may be empty for a fresh agent) and the conversation to process. This is important — by including existing memory, the LLM can make informed decisions about what to update, what to keep unchanged, and what to add.\n\nLines 113-121 make the actual LLM call. The system message at line 116 casts the LLM as a \"memory consolidation agent,\" and the `_SAVE_MEMORY_TOOL` from the previous chapter constrains its output. The same model that handles conversations also handles remembering — which means the consolidation benefits from the full reasoning capability of the underlying LLM."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Writing Memory",
+      "snippets": [
+        {
+          "filePath": "nanobot/agent/memory.py",
+          "startLine": 127,
+          "endLine": 145,
+          "content": "            args = response.tool_calls[0].arguments\n            # Some providers return arguments as a JSON string instead of dict\n            if isinstance(args, str):\n                args = json.loads(args)\n            if not isinstance(args, dict):\n                logger.warning(\"Memory consolidation: unexpected arguments type {}\", type(args).__name__)\n                return False\n\n            if entry := args.get(\"history_entry\"):\n                if not isinstance(entry, str):\n                    entry = json.dumps(entry, ensure_ascii=False)\n                self.append_history(entry)\n            if update := args.get(\"memory_update\"):\n                if not isinstance(update, str):\n                    update = json.dumps(update, ensure_ascii=False)\n                if update != current_memory:\n                    self.write_long_term(update)\n\n            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count"
+        }
+      ],
+      "explanation": "After the LLM responds, the method processes the structured output. Line 127 extracts the tool call arguments, and lines 129-133 handle a cross-provider compatibility issue: some providers return arguments as a JSON string rather than a parsed dict, so both formats are accepted.\n\nLines 135-143 write the actual memory. The `history_entry` gets appended to HISTORY.md via `append_history` — this log only ever grows. The `memory_update` replaces MEMORY.md entirely, but only if it actually changed (line 142). This avoids unnecessary disk writes when the LLM determines the conversation didn't produce new facts worth recording.\n\nLine 145 is the critical bookkeeping step: `last_consolidated` advances to mark these messages as processed. For `archive_all` mode (used by the `/new` command), it resets to 0 since the entire session is being archived. For normal consolidation, it moves the cursor forward, creating a clean boundary between processed and unprocessed messages."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Triggering Learning",
+      "snippets": [
+        {
+          "filePath": "nanobot/agent/loop.py",
+          "startLine": 396,
+          "endLine": 412,
+          "content": "        unconsolidated = len(session.messages) - session.last_consolidated\n        if (unconsolidated >= self.memory_window and session.key not in self._consolidating):\n            self._consolidating.add(session.key)\n            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())\n\n            async def _consolidate_and_unlock():\n                try:\n                    async with lock:\n                        await self._consolidate_memory(session)\n                finally:\n                    self._consolidating.discard(session.key)\n                    _task = asyncio.current_task()\n                    if _task is not None:\n                        self._consolidation_tasks.discard(_task)\n\n            _task = asyncio.create_task(_consolidate_and_unlock())\n            self._consolidation_tasks.add(_task)"
+        }
+      ],
+      "explanation": "Consolidation doesn't run on every message — it fires when the count of unconsolidated messages reaches `memory_window` (lines 396-397). The `_consolidating` set at line 398 acts as a per-session guard to prevent duplicate consolidation tasks. A per-session `asyncio.Lock` at line 399 serializes concurrent attempts.\n\nThe inner function `_consolidate_and_unlock` (line 401) wraps the actual consolidation call, ensuring cleanup happens in the `finally` block regardless of outcome. Line 411 launches it as a background `asyncio.create_task`, so message processing continues immediately. The user never waits for consolidation — learning happens silently behind the scenes."
+    },
+    {
+      "id": "chapter-10",
+      "label": "Memory Injection",
+      "snippets": [
+        {
+          "filePath": "nanobot/agent/context.py",
+          "startLine": 21,
+          "endLine": 36,
+          "content": "    def __init__(self, workspace: Path):\n        self.workspace = workspace\n        self.memory = MemoryStore(workspace)\n        self.skills = SkillsLoader(workspace)\n\n    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:\n        \"\"\"Build the system prompt from identity, bootstrap files, memory, and skills.\"\"\"\n        parts = [self._get_identity()]\n\n        bootstrap = self._load_bootstrap_files()\n        if bootstrap:\n            parts.append(bootstrap)\n\n        memory = self.memory.get_memory_context()\n        if memory:\n            parts.append(f\"# Memory\\n\\n{memory}\")"
+        }
+      ],
+      "explanation": "`ContextBuilder.__init__` at line 21 creates a `MemoryStore` instance tied to the workspace. On every interaction, `build_system_prompt` assembles the full system prompt that the LLM receives.\n\nLines 34-36 are where the learning loop closes. `self.memory.get_memory_context()` reads the contents of MEMORY.md, and if anything is there, it's appended as a `# Memory` section of the system prompt. From the LLM's perspective, consolidated knowledge is indistinguishable from its original instructions — it's simply part of who the agent \"is.\" This is how past interactions shape future behavior."
+    },
+    {
+      "id": "chapter-11",
+      "label": "Archiving & Reset",
+      "snippets": [
+        {
+          "filePath": "nanobot/agent/loop.py",
+          "startLine": 364,
+          "endLine": 391,
+          "content": "        if cmd == \"/new\":\n            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())\n            self._consolidating.add(session.key)\n            try:\n                async with lock:\n                    snapshot = session.messages[session.last_consolidated:]\n                    if snapshot:\n                        temp = Session(key=session.key)\n                        temp.messages = list(snapshot)\n                        if not await self._consolidate_memory(temp, archive_all=True):\n                            return OutboundMessage(\n                                channel=msg.channel, chat_id=msg.chat_id,\n                                content=\"Memory archival failed, session not cleared. Please try again.\",\n                            )\n            except Exception:\n                logger.exception(\"/new archival failed for {}\", session.key)\n                return OutboundMessage(\n                    channel=msg.channel, chat_id=msg.chat_id,\n                    content=\"Memory archival failed, session not cleared. Please try again.\",\n                )\n            finally:\n                self._consolidating.discard(session.key)\n\n            session.clear()\n            self.sessions.save(session)\n            self.sessions.invalidate(session.key)\n            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,\n                                  content=\"New session started.\")"
+        }
+      ],
+      "explanation": "When a user sends `/new`, Nanobot doesn't just wipe the session — it preserves what was learned first. Line 365 acquires a consolidation lock, and line 369 takes a snapshot of all unconsolidated messages. Lines 371-372 create a temporary session containing just these unprocessed messages, and line 373 consolidates them with `archive_all=True`.\n\nThe error handling here is deliberately conservative. If archival fails (lines 374-377 or 378-383), the session is **not** cleared — the user gets an error message and their data stays intact. This is a safety-first design: it's better to keep an un-archived session than to lose unprocessed conversations.\n\nOnly after successful archival do lines 387-389 clear the session, save the empty state, and invalidate the cache. The agent starts fresh, but its MEMORY.md and HISTORY.md carry forward everything it learned. A new conversation benefits from all past conversations, even though the session itself is brand new."
+    },
+    {
+      "id": "chapter-12",
+      "label": "Self-Improving Agent",
+      "snippets": [],
+      "explanation": "Nanobot's learning system is a pipeline that turns raw conversation into persistent intelligence, without ever modifying model weights. Every interaction flows through four stages: capture via the message bus, storage in append-only JSONL sessions, LLM-driven consolidation into structured memory files, and injection of that memory back into the system prompt.\n\nSeveral design decisions stand out. Using the LLM itself as the consolidation engine means memory quality scales with model capability — a more capable model produces better summaries and retains more nuanced facts. The append-only session design preserves LLM cache efficiency, an optimization that matters at scale. The two-layer memory split — a living document (MEMORY.md) plus an immutable log (HISTORY.md) — gives the agent both a compact working memory and a detailed audit trail.\n\nThe `last_consolidated` cursor is the unsung hero of the architecture. This simple integer tracks which messages have been processed, enabling background consolidation without blocking user interactions, safe session archiving via `/new`, and crash recovery through JSONL persistence.\n\nPerhaps the most elegant aspect is the `save_memory` tool trick: by framing memory consolidation as a function call rather than free-text generation, Nanobot gets structured, reliable output from any LLM provider. The learning system doesn't depend on parsing quirks or prompt engineering hacks — it leverages the same tool-calling interface the agent already uses for everything else."
+    }
+  ]
+}

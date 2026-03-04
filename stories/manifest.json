@@ -1,6 +1,12 @@
 {
   "stories": [
     {
+      "id": "nanobot-learning",
+      "title": "How Nanobot Learns: From Conversations to Persistent Memory",
+      "commitHash": "1303cc66690fd9597c6a5e13022f692dbb6a85a1",
+      "createdAt": "2026-03-04T12:00:00.000Z"
+    },
+    {
       "id": "zeroclaw-learning",
       "title": "How ZeroClaw Learns: The Memory System Deep Dive",
       "commitHash": "02cf1a558a45f7cdd4db4768af71651a3e951af5",
