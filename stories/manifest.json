@@ -1,6 +1,12 @@
 {
   "stories": [
     {
+      "id": "zeroclaw-learning",
+      "title": "How ZeroClaw Learns: The Memory System Deep Dive",
+      "commitHash": "02cf1a558a45f7cdd4db4768af71651a3e951af5",
+      "createdAt": "2026-03-04T12:00:00.000Z"
+    },
+    {
       "id": "openclaw-learning",
       "title": "How OpenClaw Learns: A Tour of the Memory System",
       "commitHash": "1c200ca7ae3cd4a3e2861b1a32fc16b917630f09",

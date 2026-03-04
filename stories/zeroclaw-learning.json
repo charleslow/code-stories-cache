@@ -1,0 +1,219 @@
+{
+  "id": "zeroclaw-learning",
+  "title": "How ZeroClaw Learns: The Memory System Deep Dive",
+  "query": "How does ZeroClaw learn from user interactions? Go deep into the learning system — how does it collect feedback, store interaction data, and improve over time?",
+  "repo": "zeroclaw-labs/zeroclaw",
+  "commitHash": "02cf1a558a45f7cdd4db4768af71651a3e951af5",
+  "createdAt": "2026-03-04T12:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "The Learning Agent",
+      "snippets": [],
+      "explanation": "How does an autonomous agent become smarter over time? ZeroClaw's answer is a multi-layered memory system that continuously captures, ranks, and recalls knowledge gained from user interactions.\n\nAt its core, the system revolves around a few key concepts. A **MemoryEntry** is the atomic unit of knowledge — a key-value pair with a category, timestamp, and relevance score. **MemoryCategory** determines a memory's lifespan: `Core` memories are permanent learned facts (preferences, decisions), `Conversation` memories are ephemeral session context, and `Daily` entries are session logs. The **Memory trait** abstracts over storage backends, from SQLite to Qdrant to Markdown files.\n\nThe learning loop works in three phases. First, the agent *stores* interaction data through automatic **fact extraction** — the LLM periodically identifies durable insights from conversation and saves them. Second, **hybrid search** combines vector similarity and keyword matching to find relevant memories. Third, **time decay** naturally fades old memories while keeping Core facts \"evergreen.\" We'll trace this loop from its data foundations through each mechanism that makes ZeroClaw progressively better at understanding its users."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Memory Anatomy",
+      "snippets": [
+        {
+          "filePath": "src/memory/traits.rs",
+          "startLine": 4,
+          "endLine": 14,
+          "content": "/// A single memory entry\n#[derive(Clone, Serialize, Deserialize)]\npub struct MemoryEntry {\n    pub id: String,\n    pub key: String,\n    pub content: String,\n    pub category: MemoryCategory,\n    pub timestamp: String,\n    pub session_id: Option<String>,\n    pub score: Option<f64>,\n}"
+        },
+        {
+          "filePath": "src/memory/traits.rs",
+          "startLine": 29,
+          "endLine": 52,
+          "content": "/// Memory categories for organization\n#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]\n#[serde(rename_all = \"snake_case\")]\npub enum MemoryCategory {\n    /// Long-term facts, preferences, decisions\n    Core,\n    /// Daily session logs\n    Daily,\n    /// Conversation context\n    Conversation,\n    /// User-defined custom category\n    Custom(String),\n}\n\nimpl std::fmt::Display for MemoryCategory {\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        match self {\n            Self::Core => write!(f, \"core\"),\n            Self::Daily => write!(f, \"daily\"),\n            Self::Conversation => write!(f, \"conversation\"),\n            Self::Custom(name) => write!(f, \"{name}\"),\n        }\n    }\n}"
+        },
+        {
+          "filePath": "src/memory/traits.rs",
+          "startLine": 54,
+          "endLine": 68,
+          "content": "/// Core memory trait — implement for any persistence backend\n#[async_trait]\npub trait Memory: Send + Sync {\n    /// Backend name\n    fn name(&self) -> &str;\n\n    /// Store a memory entry, optionally scoped to a session\n    async fn store(\n        &self,\n        key: &str,\n        content: &str,\n        category: MemoryCategory,\n        session_id: Option<&str>,\n    ) -> anyhow::Result<()>;"
+        }
+      ],
+      "explanation": "`MemoryEntry` on lines 6–14 is the atom of ZeroClaw's learned knowledge. Every memory carries an `id`, a human-readable `key` (like `preferred_language`), the `content` itself, a `category`, a timestamp, an optional `session_id` for scoping, and a `score` that drives retrieval ranking. The score field is critical — it's where vector similarity, keyword relevance, and time decay all converge into a single ranking signal.\n\nThe `MemoryCategory` enum (lines 30–41) creates a tiered knowledge system. `Core` memories are the agent's long-term learned facts — user preferences, project decisions, technical constraints. `Daily` captures session-level logs. `Conversation` holds ephemeral context that can be pruned. `Custom` allows user-defined categories. This tiering is the engine behind learning: when the agent extracts a durable fact from conversation, it promotes it to `Core`, where it becomes permanent and receives priority treatment during recall.\n\nThe `Memory` trait (lines 55–68) defines the contract every storage backend must implement — `store`, `recall`, `get`, `list`, and `forget` — keeping the learning logic completely decoupled from persistence details."
+    },
+    {
+      "id": "chapter-2",
+      "label": "The Brain Database",
+      "snippets": [
+        {
+          "filePath": "src/memory/sqlite.rs",
+          "startLine": 160,
+          "endLine": 205,
+          "content": "    /// Initialize all tables: memories, FTS5, `embedding_cache`\n    fn init_schema(conn: &Connection) -> anyhow::Result<()> {\n        conn.execute_batch(\n            \"-- Core memories table\n            CREATE TABLE IF NOT EXISTS memories (\n                id          TEXT PRIMARY KEY,\n                key         TEXT NOT NULL UNIQUE,\n                content     TEXT NOT NULL,\n                category    TEXT NOT NULL DEFAULT 'core',\n                embedding   BLOB,\n                created_at  TEXT NOT NULL,\n                updated_at  TEXT NOT NULL\n            );\n            CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);\n            CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(key);\n\n            -- FTS5 full-text search (BM25 scoring)\n            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(\n                key, content, content=memories, content_rowid=rowid\n            );\n\n            -- FTS5 triggers: keep in sync with memories table\n            CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN\n                INSERT INTO memories_fts(rowid, key, content)\n                VALUES (new.rowid, new.key, new.content);\n            END;\n            CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN\n                INSERT INTO memories_fts(memories_fts, rowid, key, content)\n                VALUES ('delete', old.rowid, old.key, old.content);\n            END;\n            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN\n                INSERT INTO memories_fts(memories_fts, rowid, key, content)\n                VALUES ('delete', old.rowid, old.key, old.content);\n                INSERT INTO memories_fts(rowid, key, content)\n                VALUES (new.rowid, new.key, new.content);\n            END;\n\n            -- Embedding cache with LRU eviction\n            CREATE TABLE IF NOT EXISTS embedding_cache (\n                content_hash TEXT PRIMARY KEY,\n                embedding    BLOB NOT NULL,\n                created_at   TEXT NOT NULL,\n                accessed_at  TEXT NOT NULL\n            );\n            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);\",\n        )?;"
+        }
+      ],
+      "explanation": "`init_schema` reveals the full architecture of ZeroClaw's \"brain.\" Lines 163–172 create the `memories` table — a straightforward relational layout with one crucial addition: the `embedding` BLOB column. This is where each memory's vector representation lives, turning the database into a hybrid vector store. Category and key indexes on lines 173–174 accelerate the filtering that happens during recall.\n\nLines 176–195 set up the full-text search engine. The `memories_fts` virtual table uses SQLite's FTS5 extension with BM25 scoring, giving the agent keyword-based retrieval out of the box. The three triggers (`memories_ai`, `memories_ad`, `memories_au`) keep the FTS index perfectly synchronized with the main table — every insert, delete, and update automatically propagates. This trigger-based sync is a deliberate architectural choice: it means store and forget operations don't need to manually maintain two tables.\n\nFinally, lines 197–204 create the `embedding_cache` — an LRU-evicted cache that stores previously computed embeddings keyed by content hash. This avoids redundant API calls to the embedding provider, which matters because embedding computation is the most expensive part of the memory pipeline. The `accessed_at` column enables LRU eviction so the cache doesn't grow unbounded."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Embedding Memories",
+      "snippets": [
+        {
+          "filePath": "src/memory/embeddings.rs",
+          "startLine": 3,
+          "endLine": 41,
+          "content": "/// Trait for embedding providers — convert text to vectors\n#[async_trait]\npub trait EmbeddingProvider: Send + Sync {\n    /// Provider name\n    fn name(&self) -> &str;\n\n    /// Embedding dimensions\n    fn dimensions(&self) -> usize;\n\n    /// Embed a batch of texts into vectors\n    async fn embed(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>>;\n\n    /// Embed a single text\n    async fn embed_one(&self, text: &str) -> anyhow::Result<Vec<f32>> {\n        let mut results = self.embed(&[text]).await?;\n        results\n            .pop()\n            .ok_or_else(|| anyhow::anyhow!(\"Empty embedding result\"))\n    }\n}\n\n// ── Noop provider (keyword-only fallback) ────────────────────\n\npub struct NoopEmbedding;\n\n#[async_trait]\nimpl EmbeddingProvider for NoopEmbedding {\n    fn name(&self) -> &str {\n        \"none\"\n    }\n\n    fn dimensions(&self) -> usize {\n        0\n    }\n\n    async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {\n        Ok(Vec::new())\n    }\n}"
+        },
+        {
+          "filePath": "src/memory/embeddings.rs",
+          "startLine": 159,
+          "endLine": 191,
+          "content": "pub fn create_embedding_provider(\n    provider: &str,\n    api_key: Option<&str>,\n    model: &str,\n    dims: usize,\n) -> Box<dyn EmbeddingProvider> {\n    match provider {\n        \"openai\" => {\n            let key = api_key.unwrap_or(\"\");\n            Box::new(OpenAiEmbedding::new(\n                \"https://api.openai.com\",\n                key,\n                model,\n                dims,\n            ))\n        }\n        \"openrouter\" => {\n            let key = api_key.unwrap_or(\"\");\n            Box::new(OpenAiEmbedding::new(\n                \"https://openrouter.ai/api/v1\",\n                key,\n                model,\n                dims,\n            ))\n        }\n        name if name.starts_with(\"custom:\") => {\n            let base_url = name.strip_prefix(\"custom:\").unwrap_or(\"\");\n            let key = api_key.unwrap_or(\"\");\n            Box::new(OpenAiEmbedding::new(base_url, key, model, dims))\n        }\n        _ => Box::new(NoopEmbedding),\n    }\n}"
+        }
+      ],
+      "explanation": "The `EmbeddingProvider` trait on lines 4–22 defines how text becomes searchable vectors. The interface is minimal: `name()`, `dimensions()`, and `embed()` for batch processing. The default `embed_one` method (line 16) delegates to the batch version, keeping the trait lean. `NoopEmbedding` on lines 26–41 is the zero-cost fallback — when no embedding API is configured, the system gracefully degrades to keyword-only search.\n\nThe factory on lines 159–191 maps provider names to implementations. `\"openai\"` and `\"openrouter\"` both use the OpenAI-compatible protocol, while `\"custom:URL\"` lets operators point at any compatible endpoint. Anything unrecognized falls back to `NoopEmbedding`. This design means ZeroClaw can leverage semantic search when an API key is available, but never *requires* one to function."
+    },
+    {
+      "id": "chapter-4",
+      "label": "Finding What Matters",
+      "snippets": [
+        {
+          "filePath": "src/memory/vector.rs",
+          "startLine": 3,
+          "endLine": 35,
+          "content": "/// Cosine similarity between two vectors. Returns 0.0–1.0.\npub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {\n    if a.len() != b.len() || a.is_empty() {\n        return 0.0;\n    }\n\n    let mut dot = 0.0_f64;\n    let mut norm_a = 0.0_f64;\n    let mut norm_b = 0.0_f64;\n\n    for (x, y) in a.iter().zip(b.iter()) {\n        let x = f64::from(*x);\n        let y = f64::from(*y);\n        dot += x * y;\n        norm_a += x * x;\n        norm_b += y * y;\n    }\n\n    let denom = norm_a.sqrt() * norm_b.sqrt();\n    if !denom.is_finite() || denom < f64::EPSILON {\n        return 0.0;\n    }\n\n    let raw = dot / denom;\n    if !raw.is_finite() {\n        return 0.0;\n    }\n\n    // Clamp to [0, 1] — embeddings are typically positive\n    #[allow(clippy::cast_possible_truncation)]\n    let sim = raw.clamp(0.0, 1.0) as f32;\n    sim\n}"
+        },
+        {
+          "filePath": "src/memory/vector.rs",
+          "startLine": 57,
+          "endLine": 78,
+          "content": "/// A scored result for hybrid merging\n#[derive(Debug, Clone)]\npub struct ScoredResult {\n    pub id: String,\n    pub vector_score: Option<f32>,\n    pub keyword_score: Option<f32>,\n    pub final_score: f32,\n}\n\n/// Hybrid merge: combine vector and keyword results with weighted fusion.\n///\n/// Normalizes each score set to [0, 1], then computes:\n///   `final_score` = `vector_weight` * `vector_score` + `keyword_weight` * `keyword_score`\n///\n/// Deduplicates by id, keeping the best score from each source.\npub fn hybrid_merge(\n    vector_results: &[(String, f32)],  // (id, cosine_similarity)\n    keyword_results: &[(String, f32)], // (id, bm25_score)\n    vector_weight: f32,\n    keyword_weight: f32,\n    limit: usize,\n) -> Vec<ScoredResult> {"
+        }
+      ],
+      "explanation": "`cosine_similarity` on lines 3–35 is the geometric heart of semantic memory. It computes the angular distance between two embedding vectors, using f64 intermediate precision (lines 9–11) to avoid floating-point accumulation errors in high-dimensional spaces (1536 dimensions is typical). The result is clamped to [0, 1] on line 33 — negative cosine values (opposing vectors) are treated as irrelevant. The careful `denom` check on lines 21–23 handles edge cases like zero vectors without panicking.\n\n`ScoredResult` (lines 59–64) and `hybrid_merge` (lines 72–78) represent the second half of the search strategy. Each result carries separate `vector_score` and `keyword_score` fields alongside the fused `final_score`. The function signature and documentation on lines 66–71 capture the key insight: vector results bring *semantic* relevance (understanding meaning), keyword results bring *lexical* precision (exact term matches), and the weighted fusion (defaulting to 0.7 vector / 0.3 keyword) balances both. Inside the function body (not shown here), BM25 scores are normalized to [0, 1] so they're comparable with cosine similarity, then results are sorted by combined score — giving the agent the best of both retrieval worlds."
+    },
+    {
+      "id": "chapter-5",
+      "label": "Loading Context",
+      "snippets": [
+        {
+          "filePath": "src/agent/memory_loader.rs",
+          "startLine": 5,
+          "endLine": 14,
+          "content": "/// Default half-life (days) for time decay in memory loading.\nconst LOADER_DECAY_HALF_LIFE_DAYS: f64 = 7.0;\n\n/// Score boost applied to `Core` category memories so durable facts and\n/// preferences surface even when keyword/semantic similarity is moderate.\nconst CORE_CATEGORY_SCORE_BOOST: f64 = 0.3;\n\n/// Over-fetch factor: retrieve more candidates than the output limit so\n/// that Core boost and re-ranking can select the best subset.\nconst RECALL_OVER_FETCH_FACTOR: usize = 2;"
+        },
+        {
+          "filePath": "src/agent/memory_loader.rs",
+          "startLine": 46,
+          "endLine": 96,
+          "content": "impl MemoryLoader for DefaultMemoryLoader {\n    async fn load_context(\n        &self,\n        memory: &dyn Memory,\n        user_message: &str,\n    ) -> anyhow::Result<String> {\n        // Over-fetch so Core-boosted entries can compete fairly after re-ranking.\n        let fetch_limit = self.limit * RECALL_OVER_FETCH_FACTOR;\n        let mut entries = memory.recall(user_message, fetch_limit, None).await?;\n        if entries.is_empty() {\n            return Ok(String::new());\n        }\n\n        // Apply time decay: older non-Core memories score lower.\n        decay::apply_time_decay(&mut entries, LOADER_DECAY_HALF_LIFE_DAYS);\n\n        // Apply Core category boost and filter by minimum relevance.\n        let mut scored: Vec<_> = entries\n            .iter()\n            .filter(|e| !memory::is_assistant_autosave_key(&e.key))\n            .filter_map(|e| {\n                let base = e.score.unwrap_or(self.min_relevance_score);\n                let boosted = if e.category == MemoryCategory::Core {\n                    (base + CORE_CATEGORY_SCORE_BOOST).min(1.0)\n                } else {\n                    base\n                };\n                if boosted >= self.min_relevance_score {\n                    Some((e, boosted))\n                } else {\n                    None\n                }\n            })\n            .collect();\n\n        // Sort by boosted score descending, then truncate to output limit.\n        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));\n        scored.truncate(self.limit);\n\n        if scored.is_empty() {\n            return Ok(String::new());\n        }\n\n        let mut context = String::from(\"[Memory context]\\n\");\n        for (entry, _) in &scored {\n            let _ = writeln!(context, \"- {}: {}\", entry.key, entry.content);\n        }\n        context.push('\\n');\n        Ok(context)\n    }\n}"
+        }
+      ],
+      "explanation": "`DefaultMemoryLoader` is where retrieval meets intelligence. The constants on lines 5–14 encode critical tuning decisions: a `CORE_CATEGORY_SCORE_BOOST` of 0.3 ensures long-term learned facts surface even when their raw similarity score is moderate, and `RECALL_OVER_FETCH_FACTOR` of 2 means the loader retrieves twice the requested limit so boosted entries can compete fairly after re-ranking.\n\nThe `load_context` method (lines 47–96) orchestrates the full recall pipeline. Line 53 over-fetches candidates from the memory backend. Line 60 applies time decay — older non-Core memories have their scores reduced exponentially. Lines 63–79 then run the Core boost and relevance filter in a single pass: each entry's base score is boosted by +0.3 if it's a `Core` memory (line 69), and entries below the `min_relevance_score` threshold (default 0.4) are discarded. Line 65 quietly filters out `assistant_resp` entries — a legacy safety measure preventing the agent from re-injecting its own previous responses as trusted context.\n\nLines 82–83 sort by boosted score and truncate to the output limit. The final formatting (lines 89–94) wraps everything in a `[Memory context]` block with `key: content` pairs, ready for injection into the LLM prompt. This is the moment where past learning becomes present knowledge — the agent's accumulated insights flow directly into its next response."
+    },
+    {
+      "id": "chapter-6",
+      "label": "Forgetting Gracefully",
+      "snippets": [
+        {
+          "filePath": "src/memory/decay.rs",
+          "startLine": 1,
+          "endLine": 45,
+          "content": "use super::traits::{MemoryCategory, MemoryEntry};\nuse chrono::{DateTime, Utc};\n\n/// Default half-life in days for time-decay scoring.\n/// After this many days, a non-Core memory's score drops to 50%.\nconst DEFAULT_HALF_LIFE_DAYS: f64 = 7.0;\n\n/// Apply exponential time decay to memory entry scores.\n///\n/// - `Core` memories are exempt (\"evergreen\") — their scores are never decayed.\n/// - Entries without a parseable RFC3339 timestamp are left unchanged.\n/// - Entries without a score (`None`) are left unchanged.\n///\n/// Decay formula: `score * 2^(-age_days / half_life_days)`\npub fn apply_time_decay(entries: &mut [MemoryEntry], half_life_days: f64) {\n    let half_life = if half_life_days <= 0.0 {\n        DEFAULT_HALF_LIFE_DAYS\n    } else {\n        half_life_days\n    };\n\n    let now = Utc::now();\n\n    for entry in entries.iter_mut() {\n        // Core memories are evergreen — never decay\n        if entry.category == MemoryCategory::Core {\n            continue;\n        }\n\n        let score = match entry.score {\n            Some(s) => s,\n            None => continue,\n        };\n\n        let ts = match DateTime::parse_from_rfc3339(&entry.timestamp) {\n            Ok(dt) => dt.with_timezone(&Utc),\n            Err(_) => continue,\n        };\n\n        let age_days = now.signed_duration_since(ts).num_seconds().max(0) as f64 / 86_400.0;\n\n        let decay_factor = (-age_days / half_life * std::f64::consts::LN_2).exp();\n        entry.score = Some(score * decay_factor);\n    }\n}"
+        }
+      ],
+      "explanation": "`apply_time_decay` implements a biologically-inspired memory model. The decay formula on line 43 — `score * 2^(-age_days / half_life)` — halves a memory's relevance score every `half_life` days (default: 7). After two weeks, a conversation memory retains only 25% of its original score.\n\nThe critical exception is on line 26: `Core` memories skip decay entirely. This creates a clean separation between learned knowledge (permanent, boosted) and conversational context (naturally fading). The design ensures that a user preference discovered weeks ago still surfaces ahead of yesterday's small talk — without requiring any explicit cleanup."
+    },
+    {
+      "id": "chapter-7",
+      "label": "Learning From Talk",
+      "snippets": [
+        {
+          "filePath": "src/agent/loop_/history.rs",
+          "startLine": 336,
+          "endLine": 404,
+          "content": "/// Accumulates conversation turns for periodic fact extraction.\n///\n/// Decoupled from `history` so tool/summary messages do not affect\n/// the extraction window.\npub(crate) struct TurnBuffer {\n    turns: Vec<(String, String)>,\n    total_chars: usize,\n    last_extract_succeeded: bool,\n}\n\n/// Outcome of a single extraction attempt.\npub(crate) struct ExtractionResult {\n    /// Number of facts successfully stored to Core memory.\n    pub stored: usize,\n    /// `true` when the LLM confirmed there are no new facts (or all parsed\n    /// facts were intentionally skipped). `false` on LLM/store failures.\n    pub no_facts: bool,\n}\n\nimpl TurnBuffer {\n    pub fn new() -> Self {\n        Self {\n            turns: Vec::new(),\n            total_chars: 0,\n            last_extract_succeeded: true,\n        }\n    }\n\n    /// Record a completed conversation turn.\n    pub fn push(&mut self, user_msg: &str, assistant_resp: &str) {\n        self.total_chars += user_msg.chars().count() + assistant_resp.chars().count();\n        self.turns\n            .push((user_msg.to_string(), assistant_resp.to_string()));\n    }\n\n    /// Whether the buffer has accumulated enough turns and content to\n    /// justify an extraction call.\n    pub fn should_extract(&self) -> bool {\n        self.turns.len() >= EXTRACT_TURN_INTERVAL && self.total_chars >= EXTRACT_MIN_CHARS\n    }\n\n    /// Drain all buffered turns and return them for extraction.\n    /// Resets character counter; `last_extract_succeeded` is cleared\n    /// until the caller confirms success via [`mark_extract_success`].\n    pub fn drain_for_extraction(&mut self) -> Vec<(String, String)> {\n        self.total_chars = 0;\n        self.last_extract_succeeded = false;\n        std::mem::take(&mut self.turns)\n    }\n\n    /// Mark the most recent extraction as successful.\n    pub fn mark_extract_success(&mut self) {\n        self.last_extract_succeeded = true;\n    }\n\n    /// Whether there are buffered turns that have not been extracted.\n    pub fn is_empty(&self) -> bool {\n        self.turns.is_empty()\n    }\n\n    /// Whether compaction should fall back to its own `flush_durable_facts`.\n    /// This returns `true` when un-extracted turns remain **or** the last\n    /// extraction failed (so durable facts may have been lost).\n    pub fn needs_compaction_fallback(&self) -> bool {\n        !self.turns.is_empty() || !self.last_extract_succeeded\n    }\n}"
+        }
+      ],
+      "explanation": "`TurnBuffer` (lines 340–404) is the mechanism that turns ephemeral conversation into permanent knowledge. Rather than extracting facts after every single exchange, the buffer accumulates turns and triggers extraction only when two conditions are met: at least `EXTRACT_TURN_INTERVAL` (5) turns have passed *and* the combined content exceeds `EXTRACT_MIN_CHARS` (200 characters). This batching is intentional — it reduces LLM calls while ensuring enough conversational context is available for meaningful extraction.\n\nThe `push` method (line 367) records each completed user/assistant exchange. `should_extract` (line 375) checks both thresholds. When extraction is due, `drain_for_extraction` (line 382) atomically drains the buffer and sets `last_extract_succeeded` to `false` — a pessimistic default that the caller must explicitly override via `mark_extract_success` (line 389). This pessimistic flag drives a subtle safety mechanism: `needs_compaction_fallback` (line 401) returns `true` if extraction hasn't confirmed success, ensuring the pre-compaction flush (covered next chapter) remains active as a backup.\n\nThe actual extraction happens in `extract_facts_from_turns` (defined above this struct). The `TurnBuffer` doesn't do the extraction itself — it's purely the scheduling and lifecycle manager. This separation of concerns means extraction can also be triggered from other paths (like pre-compaction flush) without duplicating the turn-tracking logic."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Safety Net",
+      "snippets": [
+        {
+          "filePath": "src/agent/loop_/history.rs",
+          "startLine": 194,
+          "endLine": 222,
+          "content": "/// Extract durable facts from a conversation transcript and store them as\n/// `Core` memories. Called before compaction discards old messages.\n///\n/// Best-effort: failures are logged but never block compaction.\n/// Returns `true` when facts were stored **or** the LLM confirmed\n/// there are none (`NONE` response). Returns `false` on LLM/store\n/// failures so the caller can avoid marking extraction as successful.\nasync fn flush_durable_facts(\n    provider: &dyn Provider,\n    model: &str,\n    transcript: &str,\n    memory: &dyn Memory,\n    session_id: Option<&str>,\n) -> bool {\n    const FLUSH_SYSTEM: &str = \"\\\nYou extract durable facts from a conversation that is about to be compacted. \\\nOutput ONLY facts worth remembering long-term — user preferences, project decisions, \\\ntechnical constraints, commitments, or important discoveries.\\n\\\n\\n\\\nNEVER extract secrets, API keys, tokens, passwords, credentials, \\\nor any sensitive authentication data. If the conversation contains \\\nsuch data, skip it entirely.\\n\\\n\\n\\\nOutput one fact per line, prefixed with a short key in brackets. \\\nExample:\\n\\\n[preferred_language] User prefers Rust over Go\\n\\\n[db_choice] Project uses PostgreSQL 16\\n\\\nIf there are no durable facts, output exactly: NONE\";"
+        },
+        {
+          "filePath": "src/agent/loop_/history.rs",
+          "startLine": 249,
+          "endLine": 291,
+          "content": "    for line in response.lines() {\n        if stored >= COMPACTION_MAX_FLUSH_FACTS {\n            break;\n        }\n        let line = line.trim();\n        if line.is_empty() {\n            continue;\n        }\n        // Parse \"[key] content\" format\n        if let Some((key, content)) = parse_fact_line(line) {\n            parsed += 1;\n            // Scrub secrets from extracted content.\n            let clean = crate::providers::scrub_secret_patterns(content);\n            if should_skip_redacted_fact(&clean, content) {\n                tracing::info!(\n                    \"Skipped compaction fact '{key}': only secret shell remains after redaction\"\n                );\n                continue;\n            }\n            let norm_key = normalize_fact_key(key);\n            if norm_key.is_empty() {\n                continue;\n            }\n            let prefixed_key = format!(\"auto_{norm_key}\");\n            if let Err(e) = memory\n                .store(&prefixed_key, &clean, MemoryCategory::Core, session_id)\n                .await\n            {\n                tracing::warn!(\"Failed to store compaction fact '{prefixed_key}': {e}\");\n                store_failures += 1;\n            } else {\n                stored += 1;\n            }\n        }\n    }\n    if stored > 0 {\n        tracing::info!(\"Pre-compaction flush: stored {stored} durable fact(s) to Core memory\");\n    }\n    // Success when at least one fact was parsed and no store failures\n    // occurred, OR all parsed facts were intentionally skipped.\n    // Unparseable output (parsed == 0) is treated as failure.\n    parsed > 0 && store_failures == 0\n}"
+        }
+      ],
+      "explanation": "`flush_durable_facts` (lines 194–291) is the safety net that ensures no learned knowledge is lost when conversation history must be compacted. The system prompt on lines 208–221 is carefully crafted: it asks the LLM to extract *only* long-term facts — preferences, decisions, constraints — while explicitly prohibiting secret extraction (API keys, tokens, passwords).\n\nThe parsing loop starting at line 249 processes the LLM's response line by line. Each fact must follow the `[key] content` format. Line 261 runs `scrub_secret_patterns` as a defense-in-depth measure — even if the LLM ignores the \"no secrets\" instruction, the content is sanitized before storage. The key is normalized to snake_case with an `auto_` prefix (line 272), creating a clean namespace that distinguishes machine-extracted facts from user-created ones.\n\nThe return value on line 290 is nuanced: success requires at least one fact to be *parsed* (even if all were intentionally skipped) and zero store failures. This conservative definition means the `TurnBuffer` will keep its compaction fallback active until extraction demonstrably works end-to-end."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Memory Hygiene",
+      "snippets": [
+        {
+          "filePath": "src/memory/hygiene.rs",
+          "startLine": 13,
+          "endLine": 30,
+          "content": "#[derive(Debug, Clone, Default, Serialize, Deserialize)]\nstruct HygieneReport {\n    archived_memory_files: u64,\n    archived_session_files: u64,\n    purged_memory_archives: u64,\n    purged_session_archives: u64,\n    pruned_conversation_rows: u64,\n}\n\nimpl HygieneReport {\n    fn total_actions(&self) -> u64 {\n        self.archived_memory_files\n            + self.archived_session_files\n            + self.purged_memory_archives\n            + self.purged_session_archives\n            + self.pruned_conversation_rows\n    }\n}"
+        },
+        {
+          "filePath": "src/memory/hygiene.rs",
+          "startLine": 38,
+          "endLine": 78,
+          "content": "/// Run memory/session hygiene if the cadence window has elapsed.\n///\n/// This function is intentionally best-effort: callers should log and continue on failure.\npub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {\n    if !config.hygiene_enabled {\n        return Ok(());\n    }\n\n    if !should_run_now(workspace_dir)? {\n        return Ok(());\n    }\n\n    let report = HygieneReport {\n        archived_memory_files: archive_daily_memory_files(\n            workspace_dir,\n            config.archive_after_days,\n        )?,\n        archived_session_files: archive_session_files(workspace_dir, config.archive_after_days)?,\n        purged_memory_archives: purge_memory_archives(workspace_dir, config.purge_after_days)?,\n        purged_session_archives: purge_session_archives(workspace_dir, config.purge_after_days)?,\n        pruned_conversation_rows: prune_conversation_rows(\n            workspace_dir,\n            config.conversation_retention_days,\n        )?,\n    };\n\n    write_state(workspace_dir, &report)?;\n\n    if report.total_actions() > 0 {\n        tracing::info!(\n            \"memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation_rows={}\",\n            report.archived_memory_files,\n            report.archived_session_files,\n            report.purged_memory_archives,\n            report.purged_session_archives,\n            report.pruned_conversation_rows,\n        );\n    }\n\n    Ok(())\n}"
+        }
+      ],
+      "explanation": "`HygieneReport` (lines 14–20) tracks five distinct cleanup actions, revealing the full scope of memory lifecycle management: archiving memory files, archiving session files, purging old archives, purging old session archives, and pruning conversation rows from SQLite.\n\n`run_if_due` (lines 41–78) orchestrates the cleanup with a throttled cadence. Line 42 checks the config gate — hygiene can be disabled entirely. Line 46 consults a state file to enforce a 12-hour minimum interval between runs, preventing redundant work. Lines 50–62 then execute the five cleanup stages in sequence, each with its own configurable age threshold. The conversation row pruning on line 58 specifically targets the `conversation` category, leaving `Core` memories untouched — consistent with the tiered knowledge model. Line 64 writes the updated state, and line 66 logs a summary only when something actually changed. This \"quiet when idle\" approach keeps logs clean during normal operation."
+    },
+    {
+      "id": "chapter-10",
+      "label": "Soul Persistence",
+      "snippets": [
+        {
+          "filePath": "src/memory/snapshot.rs",
+          "startLine": 1,
+          "endLine": 23,
+          "content": "//! Memory snapshot — export/import core memories as human-readable Markdown.\n//!\n//! **Atomic Soul Export**: dumps `MemoryCategory::Core` from SQLite into\n//! `MEMORY_SNAPSHOT.md` so the agent's \"soul\" is always Git-visible.\n//!\n//! **Auto-Hydration**: if `brain.db` is missing but `MEMORY_SNAPSHOT.md` exists,\n//! re-indexes all entries back into a fresh SQLite database.\n\nuse anyhow::Result;\nuse chrono::Local;\nuse rusqlite::{params, Connection};\nuse std::fmt::Write;\nuse std::fs;\nuse std::path::{Path, PathBuf};\n\n/// Filename for the snapshot (lives at workspace root for Git visibility).\npub const SNAPSHOT_FILENAME: &str = \"MEMORY_SNAPSHOT.md\";\n\n/// Header written at the top of every snapshot file.\nconst SNAPSHOT_HEADER: &str = \"# \\u{1f9e0} ZeroClaw Memory Snapshot\\n\\n\\\n    > Auto-generated by ZeroClaw. Do not edit manually unless you know what you're doing.\\n\\\n    > This file is the \\\"soul\\\" of your agent — if `brain.db` is lost, start the agent\\n\\\n    > in this workspace and it will auto-hydrate from this file.\\n\\n\";"
+        },
+        {
+          "filePath": "src/memory/snapshot.rs",
+          "startLine": 180,
+          "endLine": 199,
+          "content": "/// Check if we should auto-hydrate on startup.\n///\n/// Returns `true` if:\n/// 1. `brain.db` does NOT exist (or is empty)\n/// 2. `MEMORY_SNAPSHOT.md` DOES exist\npub fn should_hydrate(workspace_dir: &Path) -> bool {\n    let db_path = workspace_dir.join(\"memory\").join(\"brain.db\");\n    let snapshot = snapshot_path(workspace_dir);\n\n    let db_missing_or_empty = if db_path.exists() {\n        // DB exists but might be empty (freshly created)\n        fs::metadata(&db_path)\n            .map(|m| m.len() < 4096) // SQLite header is ~4096 bytes minimum\n            .unwrap_or(true)\n    } else {\n        true\n    };\n\n    db_missing_or_empty && snapshot.exists()\n}"
+        }
+      ],
+      "explanation": "The snapshot module (lines 1–7) introduces a concept unique to ZeroClaw: the agent's *soul*. Core memories — the permanent learned facts — can be exported to a human-readable `MEMORY_SNAPSHOT.md` file. The constant on line 17 names the file, and the header on lines 20–23 includes instructions for humans: \"Do not edit manually unless you know what you're doing.\"\n\nThe `export_snapshot` function (not fully shown here) queries only `Core` category memories from `brain.db`, ordered by most recently updated. This is deliberately selective — conversation and daily memories are excluded because they're ephemeral by design.\n\nThe inverse operation, `should_hydrate` (lines 185–199), checks two conditions: `brain.db` is missing or effectively empty (under 4096 bytes, line 192), and `MEMORY_SNAPSHOT.md` exists. When both hold, the agent performs cold-boot hydration — restoring its learned knowledge from the snapshot into a fresh database. This means the agent's accumulated learning survives database corruption, machine migration, or even a complete environment rebuild. The \"soul\" persists."
+    },
+    {
+      "id": "chapter-11",
+      "label": "Response Caching",
+      "snippets": [
+        {
+          "filePath": "src/memory/response_cache.rs",
+          "startLine": 15,
+          "endLine": 25,
+          "content": "/// Response cache backed by a dedicated SQLite database.\n///\n/// Lives alongside `brain.db` as `response_cache.db` so it can be\n/// independently wiped without touching memories.\npub struct ResponseCache {\n    conn: Mutex<Connection>,\n    #[allow(dead_code)]\n    db_path: PathBuf,\n    ttl_minutes: i64,\n    max_entries: usize,\n}"
+        },
+        {
+          "filePath": "src/memory/response_cache.rs",
+          "startLine": 64,
+          "endLine": 104,
+          "content": "    /// Build a deterministic cache key from model + system prompt + user prompt.\n    pub fn cache_key(model: &str, system_prompt: Option<&str>, user_prompt: &str) -> String {\n        let mut hasher = Sha256::new();\n        hasher.update(model.as_bytes());\n        hasher.update(b\"|\");\n        if let Some(sys) = system_prompt {\n            hasher.update(sys.as_bytes());\n        }\n        hasher.update(b\"|\");\n        hasher.update(user_prompt.as_bytes());\n        let hash = hasher.finalize();\n        format!(\"{:064x}\", hash)\n    }\n\n    /// Look up a cached response. Returns `None` on miss or expired entry.\n    pub fn get(&self, key: &str) -> Result<Option<String>> {\n        let conn = self.conn.lock();\n\n        let now = Local::now();\n        let cutoff = (now - Duration::minutes(self.ttl_minutes)).to_rfc3339();\n\n        let mut stmt = conn.prepare(\n            \"SELECT response FROM response_cache\n             WHERE prompt_hash = ?1 AND created_at > ?2\",\n        )?;\n\n        let result: Option<String> = stmt.query_row(params![key, cutoff], |row| row.get(0)).ok();\n\n        if result.is_some() {\n            // Bump hit count and accessed_at\n            let now_str = now.to_rfc3339();\n            conn.execute(\n                \"UPDATE response_cache\n                 SET accessed_at = ?1, hit_count = hit_count + 1\n                 WHERE prompt_hash = ?2\",\n                params![now_str, key],\n            )?;\n        }\n\n        Ok(result)\n    }"
+        }
+      ],
+      "explanation": "`ResponseCache` (lines 15–25) takes a different approach to improvement: instead of learning *new* knowledge, it remembers *previous answers*. The cache lives in a separate `response_cache.db` file, isolated from the memory brain so it can be independently wiped.\n\n`cache_key` (lines 65–76) builds a deterministic SHA-256 hash from model name, system prompt, and user prompt. This means identical questions to the same model always hit the same cache entry. The `get` method (lines 79–104) checks for a cached response within the TTL window (line 83) and bumps the `hit_count` and `accessed_at` on cache hits (lines 95–100). This access tracking enables LRU eviction — when the cache exceeds `max_entries`, the least recently accessed entries are evicted first. The agent gets faster at familiar tasks without any retraining."
+    },
+    {
+      "id": "chapter-12",
+      "label": "The Learning Loop",
+      "snippets": [],
+      "explanation": "ZeroClaw's learning system is a continuous cycle where interaction becomes insight, insight becomes memory, and memory shapes future responses. Walking through the codebase reveals several key architectural decisions that make this work.\n\nFirst, **category-based tiering** is the backbone. The distinction between Core (permanent, boosted, decay-exempt) and Conversation (ephemeral, decaying, prunable) means the system naturally distills knowledge from noise. Fact extraction promotes valuable conversation into durable Core memories — this is how the agent genuinely \"learns.\"\n\nSecond, **dual-path extraction** provides defense in depth. Post-turn extraction (via `TurnBuffer`) proactively learns during conversation, while pre-compaction flush catches anything that might be lost when history is trimmed. The pessimistic success tracking ensures one path stays active as a fallback for the other.\n\nThird, **hybrid search** means the agent can find relevant memories both semantically and by keyword, with weighted fusion balancing the two signals. Time decay and Core boosting then re-rank results so that learned facts consistently surface above recent chatter.\n\nFinally, **soul persistence** through Markdown snapshots ensures that the agent's accumulated knowledge survives beyond any single database instance. The learning isn't locked in a binary blob — it's human-readable, version-controllable, and restorable.\n\nTogether, these mechanisms create an agent that doesn't just process interactions — it accumulates understanding. Every conversation leaves a trace, and the best traces become permanent knowledge."
+    }
+  ]
+}
