@@ -1,0 +1,214 @@
+{
+  "id": "openclaw-learning",
+  "title": "How OpenClaw Learns: A Tour of the Memory System",
+  "query": "How does OpenClaw learn from user interactions? Go deep into the learning system — how does it collect feedback, store interaction data, and improve over time?",
+  "repo": "openclaw/openclaw",
+  "commitHash": "1c200ca7ae3cd4a3e2861b1a32fc16b917630f09",
+  "createdAt": "2026-03-04T12:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "Overview",
+      "snippets": [],
+      "explanation": "OpenClaw doesn't learn the way most people imagine AI learning works — there's no retraining, no gradient descent, no model weight updates. Instead, OpenClaw builds a **persistent, searchable knowledge base** from every interaction it has. Think of it as an AI that keeps meticulous notes.\n\nThe learning system has several interconnected components. **Memory files** are markdown documents (`MEMORY.md` and files under `memory/`) where the agent stores important facts, decisions, and preferences. **Session transcripts** are JSONL logs of raw conversations that become searchable after indexing. A **SQLite database** holds text chunks and their vector embeddings, enabling semantic search. **Hybrid search** combines vector similarity with keyword matching to find the right memories. **Compaction** summarizes long conversations when the context window fills up. And a **memory flush** automatically extracts knowledge before compaction erases it.\n\nTogether, these create a feedback loop: interact → capture → index → retrieve → improve future responses. The rest of this story traces that loop through the code."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Memory Schema",
+      "snippets": [
+        {
+          "filePath": "src/memory/memory-schema.ts",
+          "startLine": 3,
+          "endLine": 37,
+          "content": "export function ensureMemoryIndexSchema(params: {\n  db: DatabaseSync;\n  embeddingCacheTable: string;\n  ftsTable: string;\n  ftsEnabled: boolean;\n}): { ftsAvailable: boolean; ftsError?: string } {\n  params.db.exec(`\n    CREATE TABLE IF NOT EXISTS meta (\n      key TEXT PRIMARY KEY,\n      value TEXT NOT NULL\n    );\n  `);\n  params.db.exec(`\n    CREATE TABLE IF NOT EXISTS files (\n      path TEXT PRIMARY KEY,\n      source TEXT NOT NULL DEFAULT 'memory',\n      hash TEXT NOT NULL,\n      mtime INTEGER NOT NULL,\n      size INTEGER NOT NULL\n    );\n  `);\n  params.db.exec(`\n    CREATE TABLE IF NOT EXISTS chunks (\n      id TEXT PRIMARY KEY,\n      path TEXT NOT NULL,\n      source TEXT NOT NULL DEFAULT 'memory',\n      start_line INTEGER NOT NULL,\n      end_line INTEGER NOT NULL,\n      hash TEXT NOT NULL,\n      model TEXT NOT NULL,\n      text TEXT NOT NULL,\n      embedding TEXT NOT NULL,\n      updated_at INTEGER NOT NULL\n    );\n  `);"
+        }
+      ],
+      "explanation": "`ensureMemoryIndexSchema` sets up the SQLite foundation on which all of OpenClaw's memory rests. Three core tables tell the full story. The `meta` table (line 10) stores key-value metadata like the vector dimensions for the current embedding model. The `files` table (line 16) tracks every indexed file — its path, source type (`\"memory\"` or `\"sessions\"`), content hash, modification time, and size. The `chunks` table (line 25) is where the real action happens: each row represents a slice of a memory file, storing the raw text alongside its vector embedding, the embedding model used, and positional information (start/end lines).\n\nThis local-first SQLite approach is a deliberate architectural choice — no external database to configure, no network dependency. The `source` column (lines 18 and 28) with its default of `'memory'` hints at the dual-source design: memory files and session transcripts are stored in the same schema but tagged differently, enabling unified search across both."
+    },
+    {
+      "id": "chapter-2",
+      "label": "Chunking Knowledge",
+      "snippets": [
+        {
+          "filePath": "src/memory/internal.ts",
+          "startLine": 184,
+          "endLine": 217,
+          "content": "export function chunkMarkdown(\n  content: string,\n  chunking: { tokens: number; overlap: number },\n): MemoryChunk[] {\n  const lines = content.split(\"\\n\");\n  if (lines.length === 0) {\n    return [];\n  }\n  const maxChars = Math.max(32, chunking.tokens * 4);\n  const overlapChars = Math.max(0, chunking.overlap * 4);\n  const chunks: MemoryChunk[] = [];\n\n  let current: Array<{ line: string; lineNo: number }> = [];\n  let currentChars = 0;\n\n  const flush = () => {\n    if (current.length === 0) {\n      return;\n    }\n    const firstEntry = current[0];\n    const lastEntry = current[current.length - 1];\n    if (!firstEntry || !lastEntry) {\n      return;\n    }\n    const text = current.map((entry) => entry.line).join(\"\\n\");\n    const startLine = firstEntry.lineNo;\n    const endLine = lastEntry.lineNo;\n    chunks.push({\n      startLine,\n      endLine,\n      text,\n      hash: hashText(text),\n    });\n  };"
+        },
+        {
+          "filePath": "src/memory/internal.ts",
+          "startLine": 242,
+          "endLine": 265,
+          "content": "  for (let i = 0; i < lines.length; i += 1) {\n    const line = lines[i] ?? \"\";\n    const lineNo = i + 1;\n    const segments: string[] = [];\n    if (line.length === 0) {\n      segments.push(\"\");\n    } else {\n      for (let start = 0; start < line.length; start += maxChars) {\n        segments.push(line.slice(start, start + maxChars));\n      }\n    }\n    for (const segment of segments) {\n      const lineSize = segment.length + 1;\n      if (currentChars + lineSize > maxChars && current.length > 0) {\n        flush();\n        carryOverlap();\n      }\n      current.push({ line: segment, lineNo });\n      currentChars += lineSize;\n    }\n  }\n  flush();\n  return chunks;\n}"
+        }
+      ],
+      "explanation": "`chunkMarkdown` at line 184 takes a markdown file's content and a chunking configuration (default: 400 tokens, 80-token overlap) and produces an array of `MemoryChunk` objects. The function converts token limits to character estimates on line 192 using a simple `tokens * 4` heuristic, then walks through the file line by line.\n\nThe `flush` helper (lines 199-217) captures the current accumulated lines into a chunk, recording the exact start and end line numbers — crucial for later citation back to the source file. Each chunk gets a SHA-256 hash of its text, enabling the sync system to detect changes without re-embedding unchanged content.\n\nLines 242-265 contain the main loop. When adding a line would exceed `maxChars`, the current chunk is flushed and `carryOverlap` (defined between these two snippets) retains the tail end of the previous chunk. This overlap is the key design insight: without it, a concept spanning a chunk boundary would be split across two chunks, making neither independently searchable. The 80-token overlap creates a sliding window that preserves semantic context at boundaries — a practical trade-off between index size and retrieval quality."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Session Transcripts",
+      "snippets": [
+        {
+          "filePath": "src/memory/session-files.ts",
+          "startLine": 74,
+          "endLine": 126,
+          "content": "export async function buildSessionEntry(absPath: string): Promise<SessionFileEntry | null> {\n  try {\n    const stat = await fs.stat(absPath);\n    const raw = await fs.readFile(absPath, \"utf-8\");\n    const lines = raw.split(\"\\n\");\n    const collected: string[] = [];\n    const lineMap: number[] = [];\n    for (let jsonlIdx = 0; jsonlIdx < lines.length; jsonlIdx++) {\n      const line = lines[jsonlIdx];\n      if (!line.trim()) {\n        continue;\n      }\n      let record: unknown;\n      try {\n        record = JSON.parse(line);\n      } catch {\n        continue;\n      }\n      if (\n        !record ||\n        typeof record !== \"object\" ||\n        (record as { type?: unknown }).type !== \"message\"\n      ) {\n        continue;\n      }\n      const message = (record as { message?: unknown }).message as\n        | { role?: unknown; content?: unknown }\n        | undefined;\n      if (!message || typeof message.role !== \"string\") {\n        continue;\n      }\n      if (message.role !== \"user\" && message.role !== \"assistant\") {\n        continue;\n      }\n      const text = extractSessionText(message.content);\n      if (!text) {\n        continue;\n      }\n      const safe = redactSensitiveText(text, { mode: \"tools\" });\n      const label = message.role === \"user\" ? \"User\" : \"Assistant\";\n      collected.push(`${label}: ${safe}`);\n      lineMap.push(jsonlIdx + 1);\n    }\n    const content = collected.join(\"\\n\");\n    return {\n      path: sessionPathForFile(absPath),\n      absPath,\n      mtimeMs: stat.mtimeMs,\n      size: stat.size,\n      hash: hashText(content + \"\\n\" + lineMap.join(\",\")),\n      content,\n      lineMap,\n    };"
+        }
+      ],
+      "explanation": "`buildSessionEntry` transforms a raw JSONL session transcript into a searchable text document. It reads the file, iterates through each JSON line, and filters for `type: \"message\"` records with `role: \"user\"` or `role: \"assistant\"` (lines 92-105). Each qualifying message has its text content extracted via `extractSessionText`, then passed through `redactSensitiveText` on line 112 — a security measure that strips credentials and tokens before they enter the search index.\n\nThe output format is simple and deliberate: `\"User: ...\"` and `\"Assistant: ...\"` labels (lines 113-114) create a readable dialog that embedding models can understand semantically. The `lineMap` array (line 115) maps each line in the flattened output back to its original 1-indexed JSONL line number, so when a memory search finds a match, it can cite the exact position in the raw session file."
+    },
+    {
+      "id": "chapter-4",
+      "label": "Index Manager",
+      "snippets": [
+        {
+          "filePath": "src/memory/manager.ts",
+          "startLine": 117,
+          "endLine": 171,
+          "content": "  static async get(params: {\n    cfg: OpenClawConfig;\n    agentId: string;\n    purpose?: \"default\" | \"status\";\n  }): Promise<MemoryIndexManager | null> {\n    const { cfg, agentId } = params;\n    const settings = resolveMemorySearchConfig(cfg, agentId);\n    if (!settings) {\n      return null;\n    }\n    const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);\n    const key = `${agentId}:${workspaceDir}:${JSON.stringify(settings)}`;\n    const existing = INDEX_CACHE.get(key);\n    if (existing) {\n      return existing;\n    }\n    const pending = INDEX_CACHE_PENDING.get(key);\n    if (pending) {\n      return pending;\n    }\n    const createPromise = (async () => {\n      const providerResult = await createEmbeddingProvider({\n        config: cfg,\n        agentDir: resolveAgentDir(cfg, agentId),\n        provider: settings.provider,\n        remote: settings.remote,\n        model: settings.model,\n        fallback: settings.fallback,\n        local: settings.local,\n      });\n      const refreshed = INDEX_CACHE.get(key);\n      if (refreshed) {\n        return refreshed;\n      }\n      const manager = new MemoryIndexManager({\n        cacheKey: key,\n        cfg,\n        agentId,\n        workspaceDir,\n        settings,\n        providerResult,\n        purpose: params.purpose,\n      });\n      INDEX_CACHE.set(key, manager);\n      return manager;\n    })();\n    INDEX_CACHE_PENDING.set(key, createPromise);\n    try {\n      return await createPromise;\n    } finally {\n      if (INDEX_CACHE_PENDING.get(key) === createPromise) {\n        INDEX_CACHE_PENDING.delete(key);\n      }\n    }\n  }"
+        }
+      ],
+      "explanation": "With the schema and chunking in place, the story moves to the orchestrator that ties everything together. The static `get` method implements a singleton-per-agent pattern with double-checked locking. The cache key on line 128 combines the agent ID, workspace directory, and serialized settings — ensuring that agents with different configurations get separate indexes while identical configurations share a single instance.\n\nLines 137-162 show the creation path: when no cached instance exists, an embedding provider is initialized (supporting OpenAI, Gemini, Voyage, Mistral, Ollama, or local models), the SQLite database is opened, the schema is ensured, and file watchers are started. The `INDEX_CACHE_PENDING` map (lines 163-170) prevents duplicate creation when multiple concurrent requests arrive for the same agent — a race condition that would waste resources by initializing multiple embedding providers simultaneously."
+    },
+    {
+      "id": "chapter-5",
+      "label": "Hybrid Search",
+      "snippets": [
+        {
+          "filePath": "src/memory/manager.ts",
+          "startLine": 240,
+          "endLine": 264,
+          "content": "  async search(\n    query: string,\n    opts?: {\n      maxResults?: number;\n      minScore?: number;\n      sessionKey?: string;\n    },\n  ): Promise<MemorySearchResult[]> {\n    void this.warmSession(opts?.sessionKey);\n    if (this.settings.sync.onSearch && (this.dirty || this.sessionsDirty)) {\n      void this.sync({ reason: \"search\" }).catch((err) => {\n        log.warn(`memory sync failed (search): ${String(err)}`);\n      });\n    }\n    const cleaned = query.trim();\n    if (!cleaned) {\n      return [];\n    }\n    const minScore = opts?.minScore ?? this.settings.query.minScore;\n    const maxResults = opts?.maxResults ?? this.settings.query.maxResults;\n    const hybrid = this.settings.query.hybrid;\n    const candidates = Math.min(\n      200,\n      Math.max(1, Math.floor(maxResults * hybrid.candidateMultiplier)),\n    );"
+        },
+        {
+          "filePath": "src/memory/manager.ts",
+          "startLine": 302,
+          "endLine": 329,
+          "content": "    // If FTS isn't available, hybrid mode cannot use keyword search; degrade to vector-only.\n    const keywordResults =\n      hybrid.enabled && this.fts.enabled && this.fts.available\n        ? await this.searchKeyword(cleaned, candidates).catch(() => [])\n        : [];\n\n    const queryVec = await this.embedQueryWithTimeout(cleaned);\n    const hasVector = queryVec.some((v) => v !== 0);\n    const vectorResults = hasVector\n      ? await this.searchVector(queryVec, candidates).catch(() => [])\n      : [];\n\n    if (!hybrid.enabled || !this.fts.enabled || !this.fts.available) {\n      return vectorResults.filter((entry) => entry.score >= minScore).slice(0, maxResults);\n    }\n\n    const merged = await this.mergeHybridResults({\n      vector: vectorResults,\n      keyword: keywordResults,\n      vectorWeight: hybrid.vectorWeight,\n      textWeight: hybrid.textWeight,\n      mmr: hybrid.mmr,\n      temporalDecay: hybrid.temporalDecay,\n    });\n    const strict = merged.filter((entry) => entry.score >= minScore);\n    if (strict.length > 0 || keywordResults.length === 0) {\n      return strict.slice(0, maxResults);\n    }"
+        }
+      ],
+      "explanation": "The `search` method opens with two proactive steps that make the system feel \"alive.\" Line 248 calls `warmSession` to trigger a background sync when a session starts, and lines 249-253 fire an on-demand sync if the index has pending changes — both are fire-and-forget, so they never block the search itself. Between these two snippets, there's also an FTS-only fallback path for when no embedding provider is available.\n\nLines 302-329 orchestrate the hybrid search when both vector and keyword capabilities are present. The query is simultaneously embedded into a vector (line 308) and searched via BM25 full-text search (lines 303-306). Both result sets are merged via `mergeHybridResults` (line 318) using configurable weights — by default 70% vector similarity, 30% keyword match. The merge also applies optional MMR (Maximal Marginal Relevance) for diversity and temporal decay to downweight old memories. Results below `minScore` (default 0.35) are filtered on line 326. This dual-strategy approach ensures that both semantically similar content and exact keyword matches surface reliably."
+    },
+    {
+      "id": "chapter-6",
+      "label": "Temporal Decay",
+      "snippets": [
+        {
+          "filePath": "src/memory/temporal-decay.ts",
+          "startLine": 4,
+          "endLine": 42,
+          "content": "export type TemporalDecayConfig = {\n  enabled: boolean;\n  halfLifeDays: number;\n};\n\nexport const DEFAULT_TEMPORAL_DECAY_CONFIG: TemporalDecayConfig = {\n  enabled: false,\n  halfLifeDays: 30,\n};\n\nconst DAY_MS = 24 * 60 * 60 * 1000;\nconst DATED_MEMORY_PATH_RE = /(?:^|\\/)memory\\/(\\d{4})-(\\d{2})-(\\d{2})\\.md$/;\n\nexport function toDecayLambda(halfLifeDays: number): number {\n  if (!Number.isFinite(halfLifeDays) || halfLifeDays <= 0) {\n    return 0;\n  }\n  return Math.LN2 / halfLifeDays;\n}\n\nexport function calculateTemporalDecayMultiplier(params: {\n  ageInDays: number;\n  halfLifeDays: number;\n}): number {\n  const lambda = toDecayLambda(params.halfLifeDays);\n  const clampedAge = Math.max(0, params.ageInDays);\n  if (lambda <= 0 || !Number.isFinite(clampedAge)) {\n    return 1;\n  }\n  return Math.exp(-lambda * clampedAge);\n}\n\nexport function applyTemporalDecayToScore(params: {\n  score: number;\n  ageInDays: number;\n  halfLifeDays: number;\n}): number {\n  return params.score * calculateTemporalDecayMultiplier(params);\n}"
+        },
+        {
+          "filePath": "src/memory/temporal-decay.ts",
+          "startLine": 71,
+          "endLine": 80,
+          "content": "function isEvergreenMemoryPath(filePath: string): boolean {\n  const normalized = filePath.replaceAll(\"\\\\\", \"/\").replace(/^\\.\\//,  \"\");\n  if (normalized === \"MEMORY.md\" || normalized === \"memory.md\") {\n    return true;\n  }\n  if (!normalized.startsWith(\"memory/\")) {\n    return false;\n  }\n  return !DATED_MEMORY_PATH_RE.test(normalized);\n}"
+        }
+      ],
+      "explanation": "Lines 4-12 define the configuration: temporal decay is disabled by default but, when enabled, applies a 30-day half-life. The math on line 21 is classic exponential decay — `Math.LN2 / halfLifeDays` gives the decay constant lambda. `calculateTemporalDecayMultiplier` (line 24) then computes `e^(-λ × age)`, meaning a memory from 30 days ago retains 50% of its relevance score, while a 60-day-old memory keeps just 25%.\n\n`isEvergreenMemoryPath` (line 71) carves out an important exception: files like `MEMORY.md` or topic files under `memory/` that don't follow the `YYYY-MM-DD.md` naming pattern are treated as evergreen — they never decay. This two-tier system mirrors how organizations work: core reference documents stay permanently relevant, while daily notes naturally fade."
+    },
+    {
+      "id": "chapter-7",
+      "label": "Memory Tool",
+      "snippets": [
+        {
+          "filePath": "src/agents/tools/memory-tool.ts",
+          "startLine": 40,
+          "endLine": 99,
+          "content": "export function createMemorySearchTool(options: {\n  config?: OpenClawConfig;\n  agentSessionKey?: string;\n}): AnyAgentTool | null {\n  const ctx = resolveMemoryToolContext(options);\n  if (!ctx) {\n    return null;\n  }\n  const { cfg, agentId } = ctx;\n  return {\n    label: \"Memory Search\",\n    name: \"memory_search\",\n    description:\n      \"Mandatory recall step: semantically search MEMORY.md + memory/*.md (and optional session transcripts) before answering questions about prior work, decisions, dates, people, preferences, or todos; returns top snippets with path + lines. If response has disabled=true, memory retrieval is unavailable and should be surfaced to the user.\",\n    parameters: MemorySearchSchema,\n    execute: async (_toolCallId, params) => {\n      const query = readStringParam(params, \"query\", { required: true });\n      const maxResults = readNumberParam(params, \"maxResults\");\n      const minScore = readNumberParam(params, \"minScore\");\n      const { manager, error } = await getMemorySearchManager({\n        cfg,\n        agentId,\n      });\n      if (!manager) {\n        return jsonResult(buildMemorySearchUnavailableResult(error));\n      }\n      try {\n        const citationsMode = resolveMemoryCitationsMode(cfg);\n        const includeCitations = shouldIncludeCitations({\n          mode: citationsMode,\n          sessionKey: options.agentSessionKey,\n        });\n        const rawResults = await manager.search(query, {\n          maxResults,\n          minScore,\n          sessionKey: options.agentSessionKey,\n        });\n        const status = manager.status();\n        const decorated = decorateCitations(rawResults, includeCitations);\n        const resolved = resolveMemoryBackendConfig({ cfg, agentId });\n        const results =\n          status.backend === \"qmd\"\n            ? clampResultsByInjectedChars(decorated, resolved.qmd?.limits.maxInjectedChars)\n            : decorated;\n        const searchMode = (status.custom as { searchMode?: string } | undefined)?.searchMode;\n        return jsonResult({\n          results,\n          provider: status.provider,\n          model: status.model,\n          fallback: status.fallback,\n          citations: citationsMode,\n          mode: searchMode,\n        });\n      } catch (err) {\n        const message = err instanceof Error ? err.message : String(err);\n        return jsonResult(buildMemorySearchUnavailableResult(message));\n      }\n    },\n  };\n}"
+        }
+      ],
+      "explanation": "`createMemorySearchTool` wires the entire memory system into the agent's toolbox. The description on line 53 is telling: it calls memory search a \"Mandatory recall step\" — the agent is instructed to always search memory before answering questions about prior work, decisions, preferences, or people. This isn't optional behavior; it's baked into the tool description that the LLM sees in its system prompt.\n\nThe execute handler (lines 55-97) follows a clean pattern: resolve the memory manager, run the search, decorate results with citations, and return. Lines 67-71 show citation handling — in direct chats, each result gets a `Source: path#L10-L20` suffix so the agent can attribute its answers. Lines 80-83 handle a budget constraint for external QMD backends, clamping results by character count to avoid injecting too much context. The graceful error handling on lines 93-96 ensures that embedding provider failures surface as structured results rather than crashes."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Memory Flush Settings",
+      "snippets": [
+        {
+          "filePath": "src/auto-reply/reply/memory-flush.ts",
+          "startLine": 13,
+          "endLine": 24,
+          "content": "export const DEFAULT_MEMORY_FLUSH_PROMPT = [\n  \"Pre-compaction memory flush.\",\n  \"Store durable memories now (use memory/YYYY-MM-DD.md; create memory/ if needed).\",\n  \"IMPORTANT: If the file already exists, APPEND new content only and do not overwrite existing entries.\",\n  `If nothing to store, reply with ${SILENT_REPLY_TOKEN}.`,\n].join(\" \");\n\nexport const DEFAULT_MEMORY_FLUSH_SYSTEM_PROMPT = [\n  \"Pre-compaction memory flush turn.\",\n  \"The session is near auto-compaction; capture durable memories to disk.\",\n  `You may reply, but usually ${SILENT_REPLY_TOKEN} is correct.`,\n].join(\" \");"
+        },
+        {
+          "filePath": "src/auto-reply/reply/memory-flush.ts",
+          "startLine": 124,
+          "endLine": 169,
+          "content": "export function shouldRunMemoryFlush(params: {\n  entry?: Pick<\n    SessionEntry,\n    \"totalTokens\" | \"totalTokensFresh\" | \"compactionCount\" | \"memoryFlushCompactionCount\"\n  >;\n  /**\n   * Optional token count override for flush gating. When provided, this value is\n   * treated as a fresh context snapshot and used instead of the cached\n   * SessionEntry.totalTokens (which may be stale/unknown).\n   */\n  tokenCount?: number;\n  contextWindowTokens: number;\n  reserveTokensFloor: number;\n  softThresholdTokens: number;\n}): boolean {\n  if (!params.entry) {\n    return false;\n  }\n\n  const override = params.tokenCount;\n  const overrideTokens =\n    typeof override === \"number\" && Number.isFinite(override) && override > 0\n      ? Math.floor(override)\n      : undefined;\n\n  const totalTokens = overrideTokens ?? resolveFreshSessionTotalTokens(params.entry);\n  if (!totalTokens || totalTokens <= 0) {\n    return false;\n  }\n  const contextWindow = Math.max(1, Math.floor(params.contextWindowTokens));\n  const reserveTokens = Math.max(0, Math.floor(params.reserveTokensFloor));\n  const softThreshold = Math.max(0, Math.floor(params.softThresholdTokens));\n  const threshold = Math.max(0, contextWindow - reserveTokens - softThreshold);\n  if (threshold <= 0) {\n    return false;\n  }\n  if (totalTokens < threshold) {\n    return false;\n  }\n\n  if (hasAlreadyFlushedForCurrentCompaction(params.entry)) {\n    return false;\n  }\n\n  return true;\n}"
+        }
+      ],
+      "explanation": "Now we enter the most interesting part of the learning system — the automated feedback loop. The memory flush prompt (lines 13-18) tells the agent: \"Store durable memories now (use memory/YYYY-MM-DD.md).\" The `IMPORTANT` clause on line 16 — append only, don't overwrite — prevents the agent from accidentally destroying earlier memories during the flush.\n\n`shouldRunMemoryFlush` (line 124) gates when this extraction triggers. The threshold calculation on line 156 is `contextWindow - reserveTokens - softThreshold` — essentially, the flush fires when the session is within 4,000 tokens of its compaction point. Line 164 checks `hasAlreadyFlushedForCurrentCompaction` to prevent duplicate runs within the same compaction cycle. This per-cycle guard is critical: without it, a session hovering near the threshold could trigger repeated flush attempts, each consuming tokens and potentially writing redundant memories."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Flush Execution",
+      "snippets": [
+        {
+          "filePath": "src/auto-reply/reply/agent-runner-memory.ts",
+          "startLine": 491,
+          "endLine": 518,
+          "content": "        const result = await runEmbeddedPiAgent({\n          ...embeddedContext,\n          ...senderContext,\n          ...runBaseParams,\n          trigger: \"memory\",\n          prompt: resolveMemoryFlushPromptForRun({\n            prompt: memoryFlushSettings.prompt,\n            cfg: params.cfg,\n          }),\n          extraSystemPrompt: flushSystemPrompt,\n          bootstrapPromptWarningSignaturesSeen,\n          bootstrapPromptWarningSignature:\n            bootstrapPromptWarningSignaturesSeen[bootstrapPromptWarningSignaturesSeen.length - 1],\n          onAgentEvent: (evt) => {\n            if (evt.stream === \"compaction\") {\n              const phase = typeof evt.data.phase === \"string\" ? evt.data.phase : \"\";\n              if (phase === \"end\") {\n                memoryCompactionCompleted = true;\n              }\n            }\n          },\n        });\n        bootstrapPromptWarningSignaturesSeen = resolveBootstrapWarningSignaturesSeen(\n          result.meta?.systemPromptReport,\n        );\n        return result;\n      },\n    });"
+        }
+      ],
+      "explanation": "When the flush is triggered, `runEmbeddedPiAgent` on line 491 runs a full agent session with `trigger: \"memory\"` (line 495). The prompt (lines 496-499) substitutes the `YYYY-MM-DD` placeholder with the actual date. The agent sees the full conversation context, decides what's worth remembering, and writes it to a dated markdown file.\n\nLines 504-511 listen for compaction events during the flush itself — if the flush agent's own session triggers compaction, that's tracked so the caller can update the compaction count. This is the feedback loop made concrete: the agent extracts its own knowledge, writes it to files that the memory index watches, and those files get chunked, embedded, and made searchable for future sessions."
+    },
+    {
+      "id": "chapter-10",
+      "label": "Session Memory Hook",
+      "snippets": [
+        {
+          "filePath": "src/hooks/bundled/session-memory/handler.ts",
+          "startLine": 173,
+          "endLine": 194,
+          "content": "const saveSessionToMemory: HookHandler = async (event) => {\n  // Only trigger on reset/new commands\n  const isResetCommand = event.action === \"new\" || event.action === \"reset\";\n  if (event.type !== \"command\" || !isResetCommand) {\n    return;\n  }\n\n  try {\n    log.debug(\"Hook triggered for reset/new command\", { action: event.action });\n\n    const context = event.context || {};\n    const cfg = context.cfg as OpenClawConfig | undefined;\n    const agentId = resolveAgentIdFromSessionKey(event.sessionKey);\n    const workspaceDir = cfg\n      ? resolveAgentWorkspaceDir(cfg, agentId)\n      : path.join(resolveStateDir(process.env, os.homedir), \"workspace\");\n    const memoryDir = path.join(workspaceDir, \"memory\");\n    await fs.mkdir(memoryDir, { recursive: true });\n\n    // Get today's date for filename\n    const now = new Date(event.timestamp);\n    const dateStr = now.toISOString().split(\"T\")[0]; // YYYY-MM-DD"
+        },
+        {
+          "filePath": "src/hooks/bundled/session-memory/handler.ts",
+          "startLine": 270,
+          "endLine": 315,
+          "content": "    // If no slug, use timestamp\n    if (!slug) {\n      const timeSlug = now.toISOString().split(\"T\")[1].split(\".\")[0].replace(/:/g, \"\");\n      slug = timeSlug.slice(0, 4); // HHMM\n      log.debug(\"Using fallback timestamp slug\", { slug });\n    }\n\n    // Create filename with date and slug\n    const filename = `${dateStr}-${slug}.md`;\n    const memoryFilePath = path.join(memoryDir, filename);\n    log.debug(\"Memory file path resolved\", {\n      filename,\n      path: memoryFilePath.replace(os.homedir(), \"~\"),\n    });\n\n    // Format time as HH:MM:SS UTC\n    const timeStr = now.toISOString().split(\"T\")[1].split(\".\")[0];\n\n    // Extract context details\n    const sessionId = (sessionEntry.sessionId as string) || \"unknown\";\n    const source = (context.commandSource as string) || \"unknown\";\n\n    // Build Markdown entry\n    const entryParts = [\n      `# Session: ${dateStr} ${timeStr} UTC`,\n      \"\",\n      `- **Session Key**: ${event.sessionKey}`,\n      `- **Session ID**: ${sessionId}`,\n      `- **Source**: ${source}`,\n      \"\",\n    ];\n\n    // Include conversation content if available\n    if (sessionContent) {\n      entryParts.push(\"## Conversation Summary\", \"\", sessionContent, \"\");\n    }\n\n    const entry = entryParts.join(\"\\n\");\n\n    // Write under memory root with alias-safe file validation.\n    await writeFileWithinRoot({\n      rootDir: memoryDir,\n      relativePath: filename,\n      data: entry,\n      encoding: \"utf-8\",\n    });"
+        }
+      ],
+      "explanation": "`saveSessionToMemory` (line 173) fires on `/new` or `/reset` commands — the moments when a user explicitly ends one conversation and starts another. Lines 185-190 resolve the workspace and ensure a `memory/` directory exists. Between these two snippets, the handler reads the last 15 messages from the transcript and uses an LLM to generate a descriptive slug.\n\nThe second half shows the fallback and file creation. If the LLM slug generation fails, lines 271-275 fall back to a simple `HHMM` timestamp. The file is built as structured markdown (lines 293-305) with session metadata and a \"Conversation Summary\" section containing the recent messages. Finally, `writeFileWithinRoot` (line 310) writes it atomically. This hook ensures that important context doesn't silently vanish when users start fresh — the memory index will pick up these files on its next sync."
+    },
+    {
+      "id": "chapter-11",
+      "label": "Compaction",
+      "snippets": [
+        {
+          "filePath": "src/agents/compaction.ts",
+          "startLine": 17,
+          "endLine": 30,
+          "content": "const MERGE_SUMMARIES_INSTRUCTIONS = [\n  \"Merge these partial summaries into a single cohesive summary.\",\n  \"\",\n  \"MUST PRESERVE:\",\n  \"- Active tasks and their current status (in-progress, blocked, pending)\",\n  \"- Batch operation progress (e.g., '5/17 items completed')\",\n  \"- The last thing the user requested and what was being done about it\",\n  \"- Decisions made and their rationale\",\n  \"- TODOs, open questions, and constraints\",\n  \"- Any commitments or follow-ups promised\",\n  \"\",\n  \"PRIORITIZE recent context over older history. The agent needs to know\",\n  \"what it was doing, not just what was discussed.\",\n].join(\"\\n\");"
+        },
+        {
+          "filePath": "src/agents/compaction.ts",
+          "startLine": 264,
+          "endLine": 290,
+          "content": "export async function summarizeWithFallback(params: {\n  messages: AgentMessage[];\n  model: NonNullable<ExtensionContext[\"model\"]>;\n  apiKey: string;\n  signal: AbortSignal;\n  reserveTokens: number;\n  maxChunkTokens: number;\n  contextWindow: number;\n  customInstructions?: string;\n  summarizationInstructions?: CompactionSummarizationInstructions;\n  previousSummary?: string;\n}): Promise<string> {\n  const { messages, contextWindow } = params;\n\n  if (messages.length === 0) {\n    return params.previousSummary ?? DEFAULT_SUMMARY_FALLBACK;\n  }\n\n  // Try full summarization first\n  try {\n    return await summarizeChunks(params);\n  } catch (fullError) {\n    log.warn(\n      `Full summarization failed, trying partial: ${\n        fullError instanceof Error ? fullError.message : String(fullError)\n      }`,\n    );\n  }"
+        }
+      ],
+      "explanation": "`MERGE_SUMMARIES_INSTRUCTIONS` (lines 17-30) reveals what the compaction system values most. The \"MUST PRESERVE\" list reads like a project manager's priorities: active task status, batch progress, the user's last request, decisions with rationale, TODOs, and commitments. Line 28 adds a crucial directive: \"PRIORITIZE recent context over older history\" — the system cares more about continuity of action than completeness of record.\n\n`summarizeWithFallback` (line 264) implements a three-tier resilience strategy. First, it attempts full summarization (line 284). If that fails — perhaps because the messages exceed the model's context — it falls back to partial summarization (not shown in this snippet), processing only smaller messages and noting oversized ones. As a last resort, it records how many messages existed. This progressive degradation ensures the agent always has some context to work from, even when individual messages are enormous."
+    },
+    {
+      "id": "chapter-12",
+      "label": "Preference Persistence",
+      "snippets": [
+        {
+          "filePath": "src/auto-reply/reply/directive-handling.persist.ts",
+          "startLine": 84,
+          "endLine": 117,
+          "content": "    if (directives.hasThinkDirective && directives.thinkLevel) {\n      sessionEntry.thinkingLevel = directives.thinkLevel;\n      updated = true;\n    }\n    if (directives.hasVerboseDirective && directives.verboseLevel) {\n      applyVerboseOverride(sessionEntry, directives.verboseLevel);\n      updated = true;\n    }\n    if (directives.hasReasoningDirective && directives.reasoningLevel) {\n      if (directives.reasoningLevel === \"off\") {\n        // Persist explicit off so it overrides model-capability defaults.\n        sessionEntry.reasoningLevel = \"off\";\n      } else {\n        sessionEntry.reasoningLevel = directives.reasoningLevel;\n      }\n      reasoningChanged =\n        reasoningChanged ||\n        (directives.reasoningLevel !== prevReasoningLevel &&\n          directives.reasoningLevel !== undefined);\n      updated = true;\n    }\n    if (\n      directives.hasElevatedDirective &&\n      directives.elevatedLevel &&\n      elevatedEnabled &&\n      elevatedAllowed\n    ) {\n      // Persist \"off\" explicitly so inline `/elevated off` overrides defaults.\n      sessionEntry.elevatedLevel = directives.elevatedLevel;\n      elevatedChanged =\n        elevatedChanged ||\n        (directives.elevatedLevel !== prevElevatedLevel && directives.elevatedLevel !== undefined);\n      updated = true;\n    }"
+        }
+      ],
+      "explanation": "Lines 84-117 show how user preferences become sticky across interactions. Each directive type — thinking level, verbose mode, reasoning level, and elevated mode — follows the same pattern: check if the directive was present, update the session entry, set `updated`.\n\nThe comment on line 94 reveals an important subtlety: `reasoningLevel = \"off\"` is persisted explicitly rather than just deleting the key. This ensures an explicit `/reasoning off` overrides any model-capability defaults that would otherwise re-enable it. The same explicit-off pattern appears on line 111 for elevated mode. When `updated` is true, the session store is written to disk, making these preferences durable across reconnections."
+    },
+    {
+      "id": "chapter-13",
+      "label": "The Learning Loop",
+      "snippets": [],
+      "explanation": "OpenClaw's learning system forms a continuous cycle where every interaction potentially enriches future ones. The journey starts with **data capture**: session transcripts record every exchange as JSONL, while explicit memory files hold curated knowledge. The **indexing layer** chunks these files, generates vector embeddings, and stores everything in a local SQLite database with full-text search support.\n\nWhen the agent needs to recall past context, **hybrid search** combines semantic similarity with keyword matching, weighted and filtered by temporal decay so recent memories surface first while core reference documents never fade. The real magic is in **automated extraction**: before context window compaction erases conversational detail, a dedicated agent turn writes important information to dated markdown files. Session lifecycle hooks capture additional context when users reset conversations.\n\nThe system also **remembers preferences** — thinking levels, model choices, and verbosity settings persist per-session and survive resets. And when the context window fills, **compaction** summarizes history while preserving active tasks, decisions, and commitments.\n\nThe overarching design philosophy is pragmatic: rather than fine-tuning the underlying model, OpenClaw builds a searchable external memory that makes the same model smarter over time through better context. It's retrieval-augmented learning in practice — local-first, human-readable, and designed to degrade gracefully when resources are limited."
+    }
+  ]
+}

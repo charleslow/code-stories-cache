@@ -10,6 +10,7 @@ A personal cache of AI-generated code stories for public repositories I want to 
 - [Picoclaw's Native Telegram Integration](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=picoclaw-telegram)
 - [How PicoClaw Learns from User Interactions](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=picoclaw-user-learning)
 - [How Strawberry Detects Hallucinations: From EDFL Theory to MCP Tools](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=pythea-strawberry-hallucination-detection)
+- [How OpenClaw Learns: A Tour of the Memory System](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=openclaw-learning)
 
 ## What is a Code Story?
 
