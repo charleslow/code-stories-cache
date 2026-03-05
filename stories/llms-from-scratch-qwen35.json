@@ -1,0 +1,168 @@
+{
+  "id": "llms-from-scratch-qwen35",
+  "title": "How Qwen 3.5 Blends Linear and Full Attention",
+  "query": "How does the Qwen 3.5 architecture work? Focus on ch05/16_qwen3.5 - the hybrid linear/full attention mechanism, gated delta networks, and what makes it different from standard transformers",
+  "repo": "rasbt/LLMs-from-scratch",
+  "commitHash": "3a7b98a36acc2789bed55e1c53c609942bd56d45",
+  "createdAt": "2026-03-05T00:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "Architecture Overview",
+      "explanation": "Qwen 3.5 breaks from the standard transformer playbook. Instead of stacking identical self-attention layers, it builds a **hybrid** model that alternates between two fundamentally different token-mixing mechanisms: **full attention** (the familiar O(n²) softmax-based approach) and **linear attention** powered by **Gated Delta Networks** (an O(n) recurrent mechanism).\n\nThe key terms to know: **full attention** computes pairwise similarity between all tokens via softmax — expressive but expensive for long sequences. **Linear attention** replaces this with a fixed-size recurrent state that compresses the entire history, scaling linearly with sequence length. The **delta rule** is the update mechanism for this state — rather than blindly accumulating information, it corrects errors by computing the difference between what the state recalls and what it should store. **Gating** gives the model learnable control over both how fast the state forgets old information and how much new information flows through.\n\nThe result is a model where 75% of layers run in O(n) time while every fourth layer provides a full-attention \"checkpoint\" for global reasoning. Let's see how the pieces fit together.",
+      "snippets": []
+    },
+    {
+      "id": "chapter-1",
+      "label": "Hybrid Layer Pattern",
+      "explanation": "The `QWEN3_5_CONFIG` dictionary reveals the hybrid pattern directly: a `layer_types` list that explicitly specifies `\"linear_attention\"` or `\"full_attention\"` for each of the 24 layers. The pattern is strikingly regular — three linear layers followed by one full attention layer, repeated six times.\n\nIn the `Qwen3_5Model` constructor, lines 6-8 read this list and build each `TransformerBlock` with the corresponding type. The model also precomputes RoPE (rotary position embedding) cosine and sine buffers, but these are only used by the full attention layers — linear attention layers handle position differently through their recurrent state. Notice on line 17 that the output head shares weights with the embedding layer (weight tying), saving roughly 254 million parameters.",
+      "snippets": [
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3.5.ipynb",
+          "startLine": 1,
+          "endLine": 29,
+          "content": "# Qwen3.5-0.8B text configuration\nQWEN3_5_CONFIG = {\n    \"vocab_size\": 248_320,\n    \"context_length\": 262_144,\n    \"emb_dim\": 1_024,\n    \"n_heads\": 8,\n    \"n_layers\": 24,\n    \"hidden_dim\": 3_584,\n    \"head_dim\": 256,\n    \"qk_norm\": True,\n    \"n_kv_groups\": 2,\n    \"rope_base\": 10_000_000.0,\n    \"partial_rotary_factor\": 0.25,\n    \"rms_norm_eps\": 1e-6,\n    \"linear_conv_kernel_dim\": 4,\n    \"linear_key_head_dim\": 128,\n    \"linear_value_head_dim\": 128,\n    \"linear_num_key_heads\": 16,\n    \"linear_num_value_heads\": 16,\n    \"dtype\": torch.bfloat16,\n    \"layer_types\": [\n        \"linear_attention\", \"linear_attention\", \"linear_attention\", \"full_attention\",\n        \"linear_attention\", \"linear_attention\", \"linear_attention\", \"full_attention\",\n        \"linear_attention\", \"linear_attention\", \"linear_attention\", \"full_attention\",\n        \"linear_attention\", \"linear_attention\", \"linear_attention\", \"full_attention\",\n        \"linear_attention\", \"linear_attention\", \"linear_attention\", \"full_attention\",\n        \"linear_attention\", \"linear_attention\", \"linear_attention\", \"full_attention\",\n    ],\n}"
+        },
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3.5.ipynb",
+          "startLine": 1,
+          "endLine": 16,
+          "content": "class Qwen3_5Model(nn.Module):\n    def __init__(self, cfg):\n        super().__init__()\n\n        self.tok_emb = nn.Embedding(cfg[\"vocab_size\"], cfg[\"emb_dim\"], dtype=cfg[\"dtype\"])\n\n        layer_types = cfg.get(\"layer_types\", [\"full_attention\"] * cfg[\"n_layers\"])\n        if len(layer_types) != cfg[\"n_layers\"]:\n            raise ValueError(\"len(layer_types) must equal n_layers\")\n\n        self.trf_blocks = nn.ModuleList(\n            [TransformerBlock(cfg, layer_type, idx) for idx, layer_type in enumerate(layer_types)]\n        )\n\n        self.final_norm = RMSNorm(cfg[\"emb_dim\"], eps=cfg.get(\"rms_norm_eps\", 1e-6))\n        self.out_head = nn.Linear(cfg[\"emb_dim\"], cfg[\"vocab_size\"], bias=False, dtype=cfg[\"dtype\"])"
+        }
+      ]
+    },
+    {
+      "id": "chapter-2",
+      "label": "Transformer Block",
+      "explanation": "`TransformerBlock` is where the hybrid magic happens. The constructor picks between `GroupedQueryAttention` and `Qwen3_5GatedDeltaNet` based on `layer_type`, but crucially, both share the same pre-norm residual structure and the same `FeedForward` network. The forward method on line 20 reveals an interesting asymmetry: full attention layers receive the causal mask and RoPE parameters, while linear attention layers need neither — the delta network handles causality through its recurrent structure and doesn't use positional encodings at all. This clean dispatch means the rest of the model doesn't need to know which attention type any given layer uses.",
+      "snippets": [
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3.5.ipynb",
+          "startLine": 19,
+          "endLine": 58,
+          "content": "class TransformerBlock(nn.Module):\n    def __init__(self, cfg, layer_type, layer_idx):\n        super().__init__()\n        self.layer_type = layer_type\n\n        if layer_type == \"full_attention\":\n            self.token_mixer = GroupedQueryAttention(\n                d_in=cfg[\"emb_dim\"],\n                num_heads=cfg[\"n_heads\"],\n                head_dim=cfg[\"head_dim\"],\n                num_kv_groups=cfg[\"n_kv_groups\"],\n                qk_norm=cfg[\"qk_norm\"],\n                dtype=cfg[\"dtype\"],\n            )\n        elif layer_type == \"linear_attention\":\n            self.token_mixer = Qwen3_5GatedDeltaNet(_Qwen3_5ConfigAdapter(cfg), layer_idx)\n        else:\n            raise ValueError(f\"Unsupported layer type: {layer_type}\")\n\n        self.ff = FeedForward(cfg)\n        self.norm1 = RMSNorm(cfg[\"emb_dim\"], eps=cfg.get(\"rms_norm_eps\", 1e-6))\n        self.norm2 = RMSNorm(cfg[\"emb_dim\"], eps=cfg.get(\"rms_norm_eps\", 1e-6))\n\n    def forward(self, x, mask, cos, sin):\n        shortcut = x\n        x = self.norm1(x)\n\n        if self.layer_type == \"full_attention\":\n            x = self.token_mixer(x, mask, cos, sin)\n        else:\n            x = self.token_mixer(x)\n\n        x = x + shortcut\n\n        shortcut = x\n        x = self.norm2(x)\n        x = self.ff(x)\n        x = x + shortcut\n\n        return x"
+        }
+      ]
+    },
+    {
+      "id": "chapter-3",
+      "label": "Gated Full Attention",
+      "explanation": "Qwen 3.5's full attention isn't standard GQA — it has three key differences. First, look at line 18: `W_query` projects to `self.d_out * 2`, double the usual size. In the forward pass (lines 4-6), this doubled output gets split into `queries` and a `gate`. After computing standard scaled dot-product attention, line 27 applies `context * torch.sigmoid(gate)`, giving each head a learned ability to suppress or amplify its contribution per token.\n\nSecond, QK normalization (lines 12-15) applies RMSNorm to queries and keys independently before RoPE, stabilizing attention scores especially with the unusually large head dimension of 256. Third, `partial_rotary_factor=0.25` means only 64 of those 256 dimensions receive rotational position encoding — the rest are position-agnostic, letting the model dedicate most of its capacity to content-based matching.",
+      "snippets": [
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3.5.ipynb",
+          "startLine": 1,
+          "endLine": 30,
+          "content": "class GroupedQueryAttention(nn.Module):\n    def __init__(\n        self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None\n    ):\n        super().__init__()\n        assert num_heads % num_kv_groups == 0, \"num_heads must be divisible by num_kv_groups\"\n\n        self.num_heads = num_heads\n        self.num_kv_groups = num_kv_groups\n        self.group_size = num_heads // num_kv_groups\n\n        if head_dim is None:\n            assert d_in % num_heads == 0, \"`d_in` must be divisible by `num_heads` if `head_dim` is not set\"\n            head_dim = d_in // num_heads\n\n        self.head_dim = head_dim\n        self.d_out = num_heads * head_dim\n\n        # Qwen3.5 full-attention uses a gated Q projection (2x output dim)\n        self.W_query = nn.Linear(d_in, self.d_out * 2, bias=False, dtype=dtype)\n        self.W_key = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)\n        self.W_value = nn.Linear(d_in, num_kv_groups * head_dim, bias=False, dtype=dtype)\n\n        self.out_proj = nn.Linear(self.d_out, d_in, bias=False, dtype=dtype)\n\n        if qk_norm:\n            self.q_norm = RMSNorm(head_dim, eps=1e-6)\n            self.k_norm = RMSNorm(head_dim, eps=1e-6)\n        else:\n            self.q_norm = self.k_norm = None"
+        },
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3.5.ipynb",
+          "startLine": 32,
+          "endLine": 60,
+          "content": "    def forward(self, x, mask, cos, sin):\n        b, num_tokens, _ = x.shape\n\n        q_and_gate = self.W_query(x)\n        q_and_gate = q_and_gate.view(b, num_tokens, self.num_heads, self.head_dim * 2)\n        queries, gate = torch.chunk(q_and_gate, 2, dim=-1)\n        gate = gate.reshape(b, num_tokens, self.d_out)\n\n        keys = self.W_key(x)\n        values = self.W_value(x)\n\n        queries = queries.transpose(1, 2)\n        keys = keys.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)\n        values = values.view(b, num_tokens, self.num_kv_groups, self.head_dim).transpose(1, 2)\n\n        if self.q_norm:\n            queries = self.q_norm(queries)\n        if self.k_norm:\n            keys = self.k_norm(keys)\n\n        queries = apply_rope(queries, cos, sin)\n        keys = apply_rope(keys, cos, sin)\n\n        keys = keys.repeat_interleave(self.group_size, dim=1)\n        values = values.repeat_interleave(self.group_size, dim=1)\n\n        attn_scores = queries @ keys.transpose(2, 3)\n        attn_scores = attn_scores.masked_fill(mask, -torch.inf)\n        attn_weights = torch.softmax(\n            attn_scores * (self.head_dim ** -0.5),\n            dim=-1,\n            dtype=torch.float32,\n        ).to(queries.dtype)\n\n        context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)\n\n        # Qwen3.5 full-attention uses a gated Q projection\n        context = context * torch.sigmoid(gate)\n        return self.out_proj(context)"
+        }
+      ]
+    },
+    {
+      "id": "chapter-4",
+      "label": "Delta Net Setup",
+      "explanation": "`Qwen3_5GatedDeltaNet.__init__` sets up the linear attention replacement. Lines 229-235 configure the head structure: 16 key heads and 16 value heads, each with dimension 128. Unlike full attention's 8 heads with dim 256, linear attention uses more, smaller heads — a tradeoff favoring the recurrent state's capacity.\n\nThe depthwise `Conv1d` on lines 245-252 operates over the concatenated Q, K, V channels with `groups=self.conv_dim`, meaning each channel is convolved independently. This injects local context (kernel size 4) before the recurrent processing — important because the delta rule's state is a compressed summary and can miss fine-grained local patterns.\n\nLines 256-259 define the decay parameters: `dt_bias` and `A_log`. Together, these control how quickly the recurrent state forgets old information, similar to the forget gate in an LSTM. The four input projections at lines 287-290 produce Q/K/V, a gate `z`, a learning rate `beta`, and a decay parameter `alpha`.",
+      "snippets": [
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 226,
+          "endLine": 259,
+          "content": "class Qwen3_5GatedDeltaNet(nn.Module):\n    def __init__(self, config, layer_idx):\n        super().__init__()\n        self.hidden_size = config.hidden_size\n        self.num_v_heads = config.linear_num_value_heads\n        self.num_k_heads = config.linear_num_key_heads\n        self.head_k_dim = config.linear_key_head_dim\n        self.head_v_dim = config.linear_value_head_dim\n        self.key_dim = self.head_k_dim * self.num_k_heads\n        self.value_dim = self.head_v_dim * self.num_v_heads\n\n        self.conv_kernel_size = config.linear_conv_kernel_dim\n        self.layer_idx = layer_idx\n        self.activation = config.hidden_act\n        self.act = ACT2FN[config.hidden_act]\n        self.layer_norm_epsilon = config.rms_norm_eps\n\n        # QKV\n        self.conv_dim = self.key_dim * 2 + self.value_dim\n        self.conv1d = nn.Conv1d(\n            in_channels=self.conv_dim,\n            out_channels=self.conv_dim,\n            bias=False,\n            kernel_size=self.conv_kernel_size,\n            groups=self.conv_dim,\n            padding=self.conv_kernel_size - 1,\n        )\n\n        # time step projection (discretization)\n        # instantiate once and copy inv_dt in init_weights of PretrainedModel\n        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))\n\n        A = torch.empty(self.num_v_heads).uniform_(0, 16)\n        self.A_log = nn.Parameter(torch.log(A))"
+        },
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 287,
+          "endLine": 290,
+          "content": "        self.in_proj_qkv = nn.Linear(self.hidden_size, self.key_dim * 2 + self.value_dim, bias=False)\n        self.in_proj_z = nn.Linear(self.hidden_size, self.value_dim, bias=False)\n        self.in_proj_b = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)\n        self.in_proj_a = nn.Linear(self.hidden_size, self.num_v_heads, bias=False)"
+        }
+      ]
+    },
+    {
+      "id": "chapter-5",
+      "label": "Delta Net Forward",
+      "explanation": "The forward pass orchestrates the full pipeline. Lines 4-5 project the input into the combined QKV space, then lines 7-9 separately project the gate (`z`), learning rate (`b`), and decay (`a`). After running the causal conv1d (line 16 in the non-cache path), the combined QKV gets split into separate query, key, and value tensors at lines 19-27.\n\nThe critical computation happens at lines 33-35: `beta = b.sigmoid()` bounds the learning rate between 0 and 1, while `g = -A_log.exp() * softplus(a + dt_bias)` computes a negative decay factor — the negative sign ensures the state exponentially decays rather than explodes. Lines 40-50 then dispatch to either `chunk_gated_delta_rule` (for prefill/training, parallel within chunks) or `recurrent_gated_delta_rule` (for single-token inference). Both compute the same result — the choice is purely about computational efficiency.",
+      "snippets": [
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 320,
+          "endLine": 327,
+          "content": "        mixed_qkv = self.in_proj_qkv(hidden_states)\n        mixed_qkv = mixed_qkv.transpose(1, 2)\n\n        z = self.in_proj_z(hidden_states)\n        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)\n\n        b = self.in_proj_b(hidden_states)\n        a = self.in_proj_a(hidden_states)"
+        },
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 354,
+          "endLine": 371,
+          "content": "        mixed_qkv = mixed_qkv.transpose(1, 2)\n        query, key, value = torch.split(\n            mixed_qkv,\n            [\n                self.key_dim,\n                self.key_dim,\n                self.value_dim,\n            ],\n            dim=-1,\n        )\n\n        query = query.reshape(batch_size, seq_len, -1, self.head_k_dim)\n        key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)\n        value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)\n\n        beta = b.sigmoid()\n        # If the model is loaded in fp16, without the .float() here, A might be -inf\n        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)"
+        },
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 376,
+          "endLine": 398,
+          "content": "        if not use_precomputed_states:\n            core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(\n                query,\n                key,\n                value,\n                g=g,\n                beta=beta,\n                initial_state=None,\n                output_final_state=cache_params is not None,\n                use_qk_l2norm_in_kernel=True,\n            )\n\n        else:\n            core_attn_out, last_recurrent_state = self.recurrent_gated_delta_rule(\n                query,\n                key,\n                value,\n                g=g,\n                beta=beta,\n                initial_state=recurrent_state,\n                output_final_state=cache_params is not None,\n                use_qk_l2norm_in_kernel=True,\n            )"
+        }
+      ]
+    },
+    {
+      "id": "chapter-6",
+      "label": "Recurrent Delta Rule",
+      "explanation": "`torch_recurrent_gated_delta_rule` is the clearest expression of the delta network idea. The state `last_recurrent_state` is a `(k_head_dim × v_head_dim)` matrix — think of it as an associative memory that maps key patterns to value patterns.\n\nThe loop at lines 205-216 processes one token at a time. Line 212 decays the state by `exp(g_t)`, implementing learned forgetting. Line 213 recalls what the state currently associates with key `k_t` by computing `kv_mem = (state * k_t).sum()`. Line 214 is the delta rule itself: `delta = (v_t - kv_mem) * beta_t` — the error between what *should* be stored (`v_t`) and what *is* recalled (`kv_mem`), scaled by the learned rate `beta_t`. Line 215 writes this correction back: `state += k_t ⊗ delta`. Finally, line 216 queries the updated state with `q_t` to produce the output.\n\nThis is fundamentally different from softmax attention: instead of recomputing over all past tokens, the model maintains a fixed-size memory that gets updated and queried. The cost per token is O(k_dim × v_dim) regardless of sequence length.",
+      "snippets": [
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 182,
+          "endLine": 221,
+          "content": "def torch_recurrent_gated_delta_rule(\n    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False\n):\n    initial_dtype = query.dtype\n    if use_qk_l2norm_in_kernel:\n        query = l2norm(query, dim=-1, eps=1e-6)\n        key = l2norm(key, dim=-1, eps=1e-6)\n    query, key, value, beta, g = [\n        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)\n    ]\n\n    batch_size, num_heads, sequence_length, k_head_dim = key.shape\n    v_head_dim = value.shape[-1]\n    scale = 1 / (query.shape[-1] ** 0.5)\n    query = query * scale\n\n    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(value)\n    last_recurrent_state = (\n        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)\n        if initial_state is None\n        else initial_state.to(value)\n    )\n\n    for i in range(sequence_length):\n        q_t = query[:, :, i]\n        k_t = key[:, :, i]\n        v_t = value[:, :, i]\n        g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)\n        beta_t = beta[:, :, i].unsqueeze(-1)\n\n        last_recurrent_state = last_recurrent_state * g_t\n        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)\n        delta = (v_t - kv_mem) * beta_t\n        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)\n        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)\n\n    if not output_final_state:\n        last_recurrent_state = None\n    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)\n    return core_attn_out, last_recurrent_state"
+        }
+      ]
+    },
+    {
+      "id": "chapter-7",
+      "label": "Chunked Processing",
+      "explanation": "The recurrent version processes tokens one at a time — fine for inference, but serialized and slow for training. `torch_chunk_gated_delta_rule` achieves the same result with more parallelism by splitting the sequence into 64-token chunks.\n\nLines 133-134 scale values and keys by beta, preparing for the intra-chunk attention computation. Lines 143-144 build a `decay_mask` from the cumulative sum of the gating values — this triangular matrix captures how much each position's state has decayed relative to every other position within the chunk. The loop on lines 162-172 then processes chunks sequentially: line 164 computes intra-chunk attention (parallel within the chunk), line 167 queries the recurrent state from previous chunks, and lines 169-172 update the recurrent state with the chunk's contribution. The result is a hybrid of parallel (within-chunk) and sequential (between-chunk) computation — essentially O(n × chunk_size) rather than O(n²) or O(n × k × v).",
+      "snippets": [
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 133,
+          "endLine": 144,
+          "content": "    v_beta = value * beta.unsqueeze(-1)\n    k_beta = key * beta.unsqueeze(-1)\n    # reshape to chunks\n    query, key, value, k_beta, v_beta = [\n        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)\n    ]\n    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)\n    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)\n\n    # chunk decay\n    g = g.cumsum(dim=-1)\n    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()"
+        },
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 161,
+          "endLine": 172,
+          "content": "    # for each chunk\n    for i in range(0, total_sequence_length // chunk_size):\n        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]\n        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)\n        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state\n        v_new = v_i - v_prime\n        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state\n        core_attn_out[:, :, i] = attn_inter + attn @ v_new\n        last_recurrent_state = (\n            last_recurrent_state * g[:, :, i, -1, None, None].exp()\n            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new\n        )"
+        }
+      ]
+    },
+    {
+      "id": "chapter-8",
+      "label": "Gated Output Norm",
+      "explanation": "`Qwen3_5RMSNormGated` applies normalization followed by gating. Line 57 computes the variance for RMSNorm. Lines 59-60 normalize and scale by the learned weight — standard RMSNorm. But line 61 adds the twist: the normalized output is multiplied by `silu(gate)`, where the gate comes from a completely separate projection (`in_proj_z` in the delta network). This gives the model a bottleneck to control how much information flows out of the linear attention layer. In the forward pass, this is applied per-head (lines 404-407 reshape to head dimension before norming), meaning each head can be independently gated.",
+      "snippets": [
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 48,
+          "endLine": 63,
+          "content": "class Qwen3_5RMSNormGated(nn.Module):\n    def __init__(self, hidden_size, eps=1e-6, **kwargs):\n        super().__init__()\n        self.weight = nn.Parameter(torch.ones(hidden_size))\n        self.variance_epsilon = eps\n\n    def forward(self, hidden_states, gate=None):\n        input_dtype = hidden_states.dtype\n        hidden_states = hidden_states.to(torch.float32)\n        variance = hidden_states.pow(2).mean(-1, keepdim=True)\n        # Norm before gate\n        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)\n        hidden_states = self.weight * hidden_states.to(input_dtype)\n        hidden_states = hidden_states * F.silu(gate.to(torch.float32))\n\n        return hidden_states.to(input_dtype)"
+        },
+        {
+          "filePath": "ch05/16_qwen3.5/qwen3_5_transformers.py",
+          "startLine": 404,
+          "endLine": 411,
+          "content": "        # reshape input data into 2D tensor\n        core_attn_out = core_attn_out.reshape(-1, self.head_v_dim)\n        z = z.reshape(-1, self.head_v_dim)\n        core_attn_out = self.norm(core_attn_out, z)\n        core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)\n\n        output = self.out_proj(core_attn_out)\n        return output"
+        }
+      ]
+    },
+    {
+      "id": "chapter-9",
+      "label": "Key Takeaways",
+      "explanation": "Qwen 3.5's architecture reveals a thoughtful balance between efficiency and expressivity. The hybrid 3:1 pattern — three linear attention layers per full attention layer — means 75% of the model's computation scales linearly with sequence length, while the periodic full attention layers provide the global reasoning capability that pure linear models struggle with.\n\nThe Gated Delta Network is more than just \"cheap attention.\" Its error-correcting delta rule (storing corrections rather than raw values), learned forgetting via exponential decay, and the conv1d for local context make it a surprisingly capable token mixer. The chunked implementation bridges the gap between the clean recurrent formulation and practical GPU parallelism.\n\nSeveral design choices distinguish this from standard transformers: gated Q projections in full attention layers, per-head output gating via `Qwen3_5RMSNormGated`, partial RoPE (only 25% of dimensions), and the deliberate use of more, smaller heads in linear layers versus fewer, larger heads in full attention layers. The code is split cleanly between the notebook (standard components) and `qwen3_5_transformers.py` (novel linear attention), reflecting a modular architecture that could swap different linear attention variants with minimal changes.",
+      "snippets": []
+    }
+  ]
+}
