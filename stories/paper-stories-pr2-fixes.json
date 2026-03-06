@@ -1,0 +1,144 @@
+{
+  "id": "d106f255-b562-4c8f-9264-aab5df649ef6",
+  "title": "PR #2: The Fix Branch",
+  "query": "Walk through PR #2: the fix branch changes including CI build fix, XSS vulnerability fix in KaTeX, stale state bug in navigateChapter, and dead code removal",
+  "repo": "charleslow/paper-stories",
+  "commitHash": "e7a52be936eda14f3851ecc7904f8dc4ab4a8fe9",
+  "createdAt": "2026-03-06T12:00:00.000Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "Overview",
+      "snippets": [],
+      "explanation": "Paper Stories is a monorepo containing a React/Vite viewer for interactive, chapter-by-chapter tours of ML research papers. The viewer fetches story JSON files (either by direct URL or from GitHub repos), renders LaTeX math via KaTeX, and lets users navigate chapters with keyboard shortcuts or sidebar clicks.\n\nPR #2 — the fix branch — addresses four issues lurking in the codebase after the initial v1 launch:\n\n- **CI build fix**: The GitHub Actions workflow runs `npm ci` in the wrong directory, causing deploys to fail in the monorepo setup.\n- **XSS vulnerability**: The KaTeX math renderer enables `trust: true`, allowing malicious LaTeX in story JSON to inject arbitrary HTML.\n- **Stale state bug**: The `navigateChapter` callback captures React state in a closure, causing chapter navigation to glitch under rapid key presses.\n- **Dead code removal**: Manifest-related types and functions that were scaffolded but never wired up add unnecessary bundle weight.\n\nWe'll walk through each fix, examining the buggy code and understanding why each change matters. The story touches four files: the CI workflow YAML, `MathRenderer.tsx`, `App.tsx`, and `api.ts`."
+    },
+    {
+      "id": "chapter-1",
+      "label": "CI Pipeline",
+      "snippets": [
+        {
+          "filePath": ".github/workflows/deploy-viewer.yml",
+          "startLine": 1,
+          "endLine": 49,
+          "content": "name: Deploy Viewer to GitHub Pages\n\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n\npermissions:\n  contents: read\n  pages: write\n  id-token: write\n\nconcurrency:\n  group: pages\n  cancel-in-progress: true\n\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n\n      - uses: actions/setup-node@v4\n        with:\n          node-version: 20\n\n      - name: Install dependencies\n        working-directory: packages/viewer\n        run: npm ci\n\n      - name: Build viewer\n        working-directory: packages/viewer\n        run: npm run build\n\n      - name: Upload artifact\n        uses: actions/upload-pages-artifact@v3\n        with:\n          path: packages/viewer/dist\n\n  deploy:\n    needs: build\n    runs-on: ubuntu-latest\n    environment:\n      name: github-pages\n      url: ${{ steps.deployment.outputs.page_url }}\n    steps:\n      - name: Deploy to GitHub Pages\n        id: deployment\n        uses: actions/deploy-pages@v4"
+        }
+      ],
+      "explanation": "The deployment pipeline lives in a single YAML file that GitHub Actions runs on every push to `main`. Lines 3-6 define the trigger, while lines 8-11 set the minimum permissions needed — read access to code, write access to GitHub Pages, and an ID token for deployment authentication.\n\nThe `build` job (lines 17-38) checks out the code, sets up Node 20, installs dependencies, builds the Vite project, and uploads the `dist` folder as a Pages artifact. The `deploy` job (lines 40-49) picks up that artifact and pushes it live.\n\nNotice the `concurrency` block on lines 13-15 — it ensures that if two pushes arrive back-to-back, the first deploy is cancelled rather than both running to completion and stomping on each other. This is a thoughtful safeguard for a fast-moving project, but there's a problem hiding in the build steps that we'll uncover next."
+    },
+    {
+      "id": "chapter-2",
+      "label": "Build Fix",
+      "snippets": [
+        {
+          "filePath": ".github/workflows/deploy-viewer.yml",
+          "startLine": 27,
+          "endLine": 33,
+          "content": "      - name: Install dependencies\n        working-directory: packages/viewer\n        run: npm ci\n\n      - name: Build viewer\n        working-directory: packages/viewer\n        run: npm run build"
+        },
+        {
+          "filePath": "package.json",
+          "startLine": 1,
+          "endLine": 7,
+          "content": "{\n  \"name\": \"paper-stories\",\n  \"private\": true,\n  \"workspaces\": [\n    \"packages/*\"\n  ]\n}"
+        }
+      ],
+      "explanation": "Here's the culprit. Lines 27-29 run `npm ci` with `working-directory: packages/viewer`, as if the viewer were a standalone project. But the root `package.json` (second snippet) declares `\"workspaces\": [\"packages/*\"]`, making this an npm workspace monorepo. In that setup, the `package-lock.json` lives at the root — not inside individual workspace packages.\n\nRunning `npm ci` in a subdirectory can't find the lockfile and fails. The fix is straightforward: remove `working-directory` from the install step so `npm ci` runs where the lockfile actually lives. The build step can remain scoped to `packages/viewer`."
+    },
+    {
+      "id": "chapter-3",
+      "label": "KaTeX Renderer",
+      "snippets": [
+        {
+          "filePath": "packages/viewer/src/components/MathRenderer.tsx",
+          "startLine": 1,
+          "endLine": 34,
+          "content": "import { useMemo } from 'react';\nimport katex from 'katex';\n\ninterface MathRendererProps {\n  math: string;\n  display?: boolean;\n}\n\n/**\n * Renders KaTeX-compatible LaTeX math.\n * The content is pre-cleaned by the generation pipeline, so minimal processing needed.\n * Falls back to raw LaTeX on errors.\n */\nexport default function MathRenderer({ math, display = false }: MathRendererProps) {\n  const html = useMemo(() => {\n    try {\n      return katex.renderToString(math.trim(), {\n        displayMode: display,\n        throwOnError: false,\n        trust: true,\n        strict: false,\n      });\n    } catch {\n      return null;\n    }\n  }, [math, display]);\n\n  if (html) {\n    return <span dangerouslySetInnerHTML={{ __html: html }} />;\n  }\n\n  // Fallback: show raw LaTeX in a code block\n  return <code className=\"math-fallback\">{math}</code>;\n}"
+        }
+      ],
+      "explanation": "Moving from CI to the front-end, `MathRenderer` is a small but important component that converts LaTeX strings into rendered math. Line 2 imports KaTeX directly, and the component accepts a `math` string and an optional `display` flag (lines 4-7).\n\nThe core rendering happens in a `useMemo` block (lines 15-26). `katex.renderToString` converts LaTeX to an HTML string, memoized on `math` and `display` so it only re-renders when inputs change. The options on lines 18-21 configure display mode, error suppression, trust level, and strictness.\n\nIf KaTeX throws despite `throwOnError: false`, the catch block on line 23 returns `null`, and the component falls back to showing raw LaTeX in a `<code>` tag (line 33). This dual-path approach is defensive — the user always sees *something*, even if KaTeX can't parse unusual macros.\n\nThe next chapter zooms in on a security issue hiding in those seemingly innocent options."
+    },
+    {
+      "id": "chapter-4",
+      "label": "XSS Fix",
+      "snippets": [
+        {
+          "filePath": "packages/viewer/src/components/MathRenderer.tsx",
+          "startLine": 14,
+          "endLine": 29,
+          "content": "export default function MathRenderer({ math, display = false }: MathRendererProps) {\n  const html = useMemo(() => {\n    try {\n      return katex.renderToString(math.trim(), {\n        displayMode: display,\n        throwOnError: false,\n        trust: true,\n        strict: false,\n      });\n    } catch {\n      return null;\n    }\n  }, [math, display]);\n\n  if (html) {\n    return <span dangerouslySetInnerHTML={{ __html: html }} />;\n  }"
+        }
+      ],
+      "explanation": "Line 20 is where the trouble starts: `trust: true`. This KaTeX option controls whether commands like `\\url{}`, `\\href{}`, and `\\includegraphics{}` are allowed to generate arbitrary HTML output. When trust is enabled, KaTeX will happily produce `<a>` tags, `<img>` tags, and other HTML elements from LaTeX input — exactly what the original developer wanted for faithful paper rendering.\n\nBut look at line 29: `dangerouslySetInnerHTML={{ __html: html }}`. React's own naming convention here is a warning — this bypasses React's XSS protections and injects raw HTML into the DOM. When combined with `trust: true`, a malicious story JSON could embed LaTeX like `\\href{javascript:alert('xss')}{click me}` and execute arbitrary scripts in the viewer.\n\nThe attack vector is real because story JSON files are fetched from user-provided URLs. An attacker could host a crafted story JSON that exploits this to steal session data or redirect users.\n\nThe fix removes `trust: true` (defaulting to `false`), which tells KaTeX to refuse rendering potentially dangerous commands. Some exotic LaTeX may render as raw fallback text instead, but that's an acceptable tradeoff — security over fidelity. The `dangerouslySetInnerHTML` stays because it's needed for KaTeX's normal HTML output, but now the input to that pipeline is sanitized."
+    },
+    {
+      "id": "chapter-5",
+      "label": "App State",
+      "snippets": [
+        {
+          "filePath": "packages/viewer/src/App.tsx",
+          "startLine": 8,
+          "endLine": 30,
+          "content": "type AppState =\n  | { status: 'landing' }\n  | { status: 'loading'; url: string }\n  | { status: 'error'; message: string }\n  | { status: 'ready'; story: Story; currentChapter: number };\n\nexport default function App() {\n  const [state, setState] = useState<AppState>({ status: 'landing' });\n\n  useEffect(() => {\n    const { storyUrl } = parseStoryUrl();\n    if (storyUrl) {\n      setState({ status: 'loading', url: storyUrl });\n      fetchStory(storyUrl)\n        .then(story => {\n          setState({ status: 'ready', story, currentChapter: 0 });\n          saveRecent(story);\n        })\n        .catch(err => {\n          setState({ status: 'error', message: err.message });\n        });\n    }\n  }, []);"
+        }
+      ],
+      "explanation": "Before we tackle the stale state bug, we need to understand how the app manages state. Lines 8-12 define `AppState` as a discriminated union — a TypeScript pattern where the `status` field determines which other fields exist. The app can be in one of four states: `landing`, `loading`, `error`, or `ready`.\n\nThe `App` component (line 14) initializes in `landing` state. The `useEffect` on lines 17-30 fires once on mount: it parses URL parameters to find a story URL, transitions to `loading`, fetches the story JSON, validates it, and lands in the `ready` state with `currentChapter: 0`. If anything fails, it transitions to `error`.\n\nNotice line 18 — only `storyUrl` is destructured from `parseStoryUrl()`. The function also returns a `manifestUrl`, but nothing consumes it. We'll revisit that orphaned return value in the dead code chapter."
+    },
+    {
+      "id": "chapter-6",
+      "label": "Stale Closure",
+      "snippets": [
+        {
+          "filePath": "packages/viewer/src/App.tsx",
+          "startLine": 32,
+          "endLine": 37,
+          "content": "  const navigateChapter = useCallback((index: number) => {\n    if (state.status === 'ready') {\n      const clamped = Math.max(0, Math.min(index, state.story.chapters.length - 1));\n      setState({ ...state, currentChapter: clamped });\n    }\n  }, [state]);"
+        }
+      ],
+      "explanation": "`navigateChapter` is the central navigation function, wrapped in `useCallback` with `[state]` as its dependency array (line 37). When called, it checks that the app is in `ready` state (line 33), clamps the requested chapter index to valid bounds (line 34), and calls `setState` to update the current chapter.\n\nThe bug is subtle and lives on line 35: `setState({ ...state, currentChapter: clamped })`. This spreads the *captured* `state` — the value `state` had when this particular instance of `navigateChapter` was created. If React hasn't re-rendered between two rapid calls (say, a user holding down the arrow key), both calls spread the *same* stale `state` snapshot. The second call overwrites the first's chapter change, effectively \"losing\" a navigation step.\n\nThe fix replaces the spread with a functional state updater: `setState(prev => ({ ...prev, currentChapter: clamped }))`. The functional form receives the *latest* state as its argument, regardless of when the closure was created. This also means `navigateChapter` no longer needs `state` in its dependency array — it can depend on nothing, making it a stable reference.\n\nThis is a classic React anti-pattern: anytime you use `setState` inside a `useCallback` that also reads the current state, you should reach for the functional updater. The object-spread approach only works reliably within a single synchronous render cycle."
+    },
+    {
+      "id": "chapter-7",
+      "label": "Keyboard Handler",
+      "snippets": [
+        {
+          "filePath": "packages/viewer/src/App.tsx",
+          "startLine": 39,
+          "endLine": 71,
+          "content": "  // Keyboard navigation\n  useEffect(() => {\n    if (state.status !== 'ready') return;\n\n    const handler = (e: KeyboardEvent) => {\n      // Don't capture when typing in input\n      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;\n\n      switch (e.key) {\n        case 'ArrowLeft':\n        case 'h':\n          navigateChapter(state.currentChapter - 1);\n          break;\n        case 'ArrowRight':\n        case 'l':\n          navigateChapter(state.currentChapter + 1);\n          break;\n        case 'Home':\n          navigateChapter(0);\n          break;\n        case 'End':\n          navigateChapter(state.story.chapters.length - 1);\n          break;\n        default:\n          if (e.key >= '1' && e.key <= '9') {\n            navigateChapter(parseInt(e.key) - 1);\n          }\n      }\n    };\n\n    window.addEventListener('keydown', handler);\n    return () => window.removeEventListener('keydown', handler);\n  }, [state, navigateChapter]);"
+        }
+      ],
+      "explanation": "The keyboard handler compounds the stale closure problem. This `useEffect` (lines 40-71) sets up a `keydown` listener that maps arrow keys, vim-style `h`/`l`, `Home`/`End`, and number keys `1`-`9` to chapter navigation. Lines 45-46 smartly skip the handler when the user is typing in an input field.\n\nThe dependency array on line 71 is `[state, navigateChapter]`. Since `navigateChapter` depends on `state` (from its own dependency array), every state change tears down and re-registers this listener. That's a lot of churn — every chapter navigation triggers a `removeEventListener` followed by a fresh `addEventListener`.\n\nWorse, lines 50 and 54 pass `state.currentChapter - 1` and `state.currentChapter + 1` to `navigateChapter`. Both `state` references come from the closure, so they're subject to the same staleness issue. Under rapid input, the handler might read `currentChapter: 3` while the state has already moved to `4`, sending the user backward instead of forward.\n\nWith the functional updater fix from the previous chapter, `navigateChapter` becomes stable (no `state` dependency), and this effect's dependency array can shrink to just `[navigateChapter]` — meaning the listener is registered once and never torn down until unmount."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Dead Code",
+      "snippets": [
+        {
+          "filePath": "packages/viewer/src/api.ts",
+          "startLine": 80,
+          "endLine": 97,
+          "content": "export interface ManifestEntry {\n  id: string;\n  title: string;\n  arxivId?: string;\n  createdAt: string;\n}\n\nexport interface Manifest {\n  stories: ManifestEntry[];\n}\n\nexport async function fetchManifest(url: string): Promise<Manifest> {\n  const response = await fetch(url);\n  if (!response.ok) {\n    throw new Error(`Failed to fetch manifest: ${response.status}`);\n  }\n  return response.json();\n}"
+        },
+        {
+          "filePath": "packages/viewer/src/api.ts",
+          "startLine": 11,
+          "endLine": 17,
+          "content": "export function parseStoryUrl(): { storyUrl: string | null; manifestUrl: string | null } {\n  const params = new URLSearchParams(window.location.search);\n\n  // Direct URL\n  const directUrl = params.get('url');\n  if (directUrl) {\n    return { storyUrl: directUrl, manifestUrl: null };"
+        },
+        {
+          "filePath": "packages/viewer/src/App.tsx",
+          "startLine": 17,
+          "endLine": 19,
+          "content": "  useEffect(() => {\n    const { storyUrl } = parseStoryUrl();\n    if (storyUrl) {"
+        }
+      ],
+      "explanation": "The final fix is cleanup. Lines 80-89 in `api.ts` define `ManifestEntry` and `Manifest` interfaces, and lines 91-97 export a `fetchManifest` function. These were scaffolded for a \"story browser\" feature — loading a manifest of all available stories from a repo. But no component in the viewer ever imports them.\n\nThe second snippet shows `parseStoryUrl` (line 11) returning both `storyUrl` and `manifestUrl`. But as the third snippet confirms, `App.tsx` line 18 destructures only `storyUrl`. The `manifestUrl` codepath constructs a URL that nobody reads.\n\nRemoving these dead exports shrinks the bundle, simplifies the API surface, and eliminates confusion for anyone reading the code. Dead code isn't just wasted bytes — it's misleading documentation."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Summary",
+      "snippets": [],
+      "explanation": "This fix branch addresses four distinct issues, but they share a common theme: the subtle gaps between \"works in development\" and \"works in production.\"\n\nThe **CI build fix** reminds us that monorepo tooling has conventions — lockfiles live at the root — and CI pipelines must respect them. It's the kind of bug that only surfaces in CI, never locally, because developers instinctively run `npm install` from the repo root.\n\nThe **XSS vulnerability** illustrates how a single flag (`trust: true`) can undermine an entire security model. KaTeX's `trust` option exists for a reason, but combining it with `dangerouslySetInnerHTML` in a context where input comes from untrusted URLs is a recipe for exploitation.\n\nThe **stale state fix** tackles one of React's most notorious footguns: closures that capture state snapshots. The functional updater pattern (`setState(prev => ...)`) is the idiomatic escape hatch, and it pays dividends by stabilizing callback references and reducing effect churn.\n\nFinally, the **dead code removal** is about code hygiene. Unused exports confuse readers, inflate bundles, and suggest features that don't exist. Removing them isn't just tidying up — it's making the codebase honest about what it actually does."
+    }
+  ]
+}

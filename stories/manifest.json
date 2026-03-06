@@ -1,6 +1,12 @@
 {
   "stories": [
     {
+      "id": "paper-stories-pr2-fixes",
+      "title": "PR #2: The Fix Branch",
+      "commitHash": "e7a52be936eda14f3851ecc7904f8dc4ab4a8fe9",
+      "createdAt": "2026-03-06T12:00:00.000Z"
+    },
+    {
       "id": "llms-from-scratch-qwen35",
       "title": "How Qwen 3.5 Blends Linear and Full Attention",
       "commitHash": "3a7b98a36acc2789bed55e1c53c609942bd56d45",
