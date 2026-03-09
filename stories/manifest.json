@@ -65,6 +65,11 @@
       "title": "How PicoClaw Runs on Your Claude Code Subscription",
       "commitHash": "946af6b53db371a1dba5a09ae52ca3c034d65086",
       "createdAt": "2026-03-03T12:00:00.000Z"
+    },
+    {
+      "id": "picoclaw-multi-session",
+      "title": "Breaking the Sequential Bottleneck: Multi-Session Processing in PicoClaw",
+      "createdAt": "2026-03-09T12:00:00.000Z"
     }
   ]
 }
