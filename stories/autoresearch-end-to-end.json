@@ -1,0 +1,252 @@
+{
+  "id": "autoresearch-end-to-end",
+  "title": "Autoresearch End to End: Autonomous AI-Driven LLM Training",
+  "query": "How does autoresearch work end to end? What are the key design choices?",
+  "repo": "karpathy/autoresearch",
+  "commitHash": "068d93da75aa45f72ba482046f108241aaaf1b8e",
+  "createdAt": "2026-03-09T20:35:00Z",
+  "chapters": [
+    {
+      "id": "chapter-0",
+      "label": "The Big Idea",
+      "snippets": [],
+      "explanation": "Autoresearch flips the traditional ML research workflow on its head. Instead of a human editing training code, running experiments, and interpreting results, an AI agent does all of that autonomously — overnight if you like. The repo has just three files that matter: `prepare.py` (fixed infrastructure: data loading, tokenizer, evaluation), `train.py` (the single file the agent modifies), and `program.md` (English-language instructions that tell the agent how to behave).\n\nThe agent's loop is simple: modify `train.py`, train for exactly 5 minutes, check if validation **bits per byte** (val_bpb) improved, keep or discard the change, repeat forever. Two key constraints make this work: a fixed wall-clock time budget ensures every experiment is directly comparable regardless of what the agent changes, and a vocab-size-independent metric (BPB) means even architectural changes get a fair evaluation. The human's job shifts from writing Python to writing the \"program\" in `program.md` — effectively programming the research organization itself."
+    },
+    {
+      "id": "chapter-1",
+      "label": "Agent Instructions",
+      "snippets": [
+        {
+          "filePath": "program.md",
+          "startLine": 94,
+          "endLine": 112,
+          "content": "LOOP FOREVER:\n\n1. Look at the git state: the current branch/commit we're on\n2. Tune `train.py` with an experimental idea by directly hacking the code.\n3. git commit\n4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)\n5. Read out the results: `grep \"^val_bpb:\\|^peak_vram_mb:\" run.log`\n6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.\n7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)\n8. If val_bpb improved (lower), you \"advance\" the branch, keeping the git commit\n9. If val_bpb is equal or worse, you git reset back to where you started\n\nThe idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).\n\n**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).\n\n**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log \"crash\" as the status in the tsv, and move on.\n\n**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask \"should I keep going?\" or \"is this a good stopping point?\". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period."
+        }
+      ],
+      "explanation": "Here's the heartbeat of the entire system: an infinite loop written in English. The agent modifies `train.py` (step 2), commits (step 3), runs training with output redirected to a log file (step 4), then greps for the key metric (step 5). The keep/discard decision on steps 8-9 is pure git — an improvement means the commit stays, a regression means `git reset`.\n\nNotice the \"NEVER STOP\" directive at the end. The agent is told to work *indefinitely* until manually interrupted. If it runs out of ideas, it should \"think harder.\" This is the key philosophical choice: the human wakes up to a `results.tsv` and a git log of experiments. The `program.md` file is, in Karpathy's framing, the \"source code\" of the research organization — you iterate on it like you would iterate on any codebase."
+    },
+    {
+      "id": "chapter-2",
+      "label": "Fixed Ground Rules",
+      "snippets": [
+        {
+          "filePath": "prepare.py",
+          "startLine": 30,
+          "endLine": 51,
+          "content": "MAX_SEQ_LEN = 2048       # context length\nTIME_BUDGET = 300        # training time budget in seconds (5 minutes)\nEVAL_TOKENS = 40 * 524288  # number of tokens for val eval\n\n# ---------------------------------------------------------------------------\n# Configuration\n# ---------------------------------------------------------------------------\n\nCACHE_DIR = os.path.join(os.path.expanduser(\"~\"), \".cache\", \"autoresearch\")\nDATA_DIR = os.path.join(CACHE_DIR, \"data\")\nTOKENIZER_DIR = os.path.join(CACHE_DIR, \"tokenizer\")\nBASE_URL = \"https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main\"\nMAX_SHARD = 6542 # the last datashard is shard_06542.parquet\nVAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)\nVAL_FILENAME = f\"shard_{VAL_SHARD:05d}.parquet\"\nVOCAB_SIZE = 8192\n\n# BPE split pattern (GPT-4 style, with \\p{N}{1,2} instead of {1,3})\nSPLIT_PATTERN = r\"\"\"'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}+|\\p{N}{1,2}| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+\"\"\"\n\nSPECIAL_TOKENS = [f\"<|reserved_{i}|>\" for i in range(4)]\nBOS_TOKEN = \"<|reserved_0|>\""
+        }
+      ],
+      "explanation": "These constants in `prepare.py` form the immovable foundation of every experiment. `TIME_BUDGET = 300` on line 31 is the single most important design choice in the system — the 5-minute wall-clock training budget that makes every experiment directly comparable. `MAX_SEQ_LEN = 2048` (line 30) sets the context window, and `EVAL_TOKENS` (line 32) controls validation evaluation size.\n\nBelow, `VOCAB_SIZE = 8192` (line 45) and the GPT-4-style BPE split pattern define the tokenizer. The validation shard is pinned to the last shard (line 43), ensuring every experiment evaluates on identical data. The agent can never touch any of this — it lives in `prepare.py`, which is off-limits. By fixing the evaluation harness and data pipeline, you create a fair playing field where the agent's only lever is the model and training code in `train.py`."
+    },
+    {
+      "id": "chapter-3",
+      "label": "Smart Data Packing",
+      "snippets": [
+        {
+          "filePath": "prepare.py",
+          "startLine": 275,
+          "endLine": 281,
+          "content": "def make_dataloader(tokenizer, B, T, split, buffer_size=1000):\n    \"\"\"\n    BOS-aligned dataloader with best-fit packing.\n    Every row starts with BOS. Documents packed using best-fit to minimize cropping.\n    When no document fits remaining space, crops shortest doc to fill exactly.\n    100% utilization (no padding).\n    \"\"\""
+        },
+        {
+          "filePath": "prepare.py",
+          "startLine": 304,
+          "endLine": 336,
+          "content": "    while True:\n        for row_idx in range(B):\n            pos = 0\n            while pos < row_capacity:\n                while len(doc_buffer) < buffer_size:\n                    refill_buffer()\n\n                remaining = row_capacity - pos\n\n                # Find largest doc that fits entirely\n                best_idx = -1\n                best_len = 0\n                for i, doc in enumerate(doc_buffer):\n                    doc_len = len(doc)\n                    if doc_len <= remaining and doc_len > best_len:\n                        best_idx = i\n                        best_len = doc_len\n\n                if best_idx >= 0:\n                    doc = doc_buffer.pop(best_idx)\n                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)\n                    pos += len(doc)\n                else:\n                    # No doc fits — crop shortest to fill remaining\n                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))\n                    doc = doc_buffer.pop(shortest_idx)\n                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)\n                    pos += remaining\n\n        cpu_inputs.copy_(row_buffer[:, :-1])\n        cpu_targets.copy_(row_buffer[:, 1:])\n        gpu_buffer.copy_(cpu_buffer, non_blocking=True)\n        yield inputs, targets, epoch"
+        }
+      ],
+      "explanation": "`make_dataloader` implements a surprisingly thoughtful packing strategy. Every row starts with a BOS token, and documents are packed using best-fit bin packing — achieving 100% token utilization with zero padding.\n\nThe inner loop (lines 304-331) fills each batch row by scanning the document buffer for the largest document that fits the remaining capacity (lines 314-320). When nothing fits entirely, it crops the shortest document to fill the gap exactly (lines 328-330). This is cleverer than the simpler approaches: concatenating and chunking loses document boundaries, while padding wastes compute. Best-fit packing preserves BOS alignment while ensuring every position carries real training signal.\n\nBetween these two snippets, the method sets up pre-allocated CPU and GPU buffers with pinned memory. Lines 333-335 handle the final transfer: `row_buffer` is split into inputs and targets (offset by one token for next-token prediction), then copied to GPU via `non_blocking=True` for maximum throughput."
+    },
+    {
+      "id": "chapter-4",
+      "label": "Bits Per Byte",
+      "snippets": [
+        {
+          "filePath": "prepare.py",
+          "startLine": 342,
+          "endLine": 364,
+          "content": "@torch.no_grad()\ndef evaluate_bpb(model, tokenizer, batch_size):\n    \"\"\"\n    Bits per byte (BPB): vocab size-independent evaluation metric.\n    Sums per-token cross-entropy (in nats), sums target byte lengths,\n    then converts nats/byte to bits/byte. Special tokens (byte length 0)\n    are excluded from both sums.\n    Uses fixed MAX_SEQ_LEN so results are comparable across configs.\n    \"\"\"\n    token_bytes = get_token_bytes(device=\"cuda\")\n    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, \"val\")\n    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)\n    total_nats = 0.0\n    total_bytes = 0\n    for _ in range(steps):\n        x, y, _ = next(val_loader)\n        loss_flat = model(x, y, reduction='none').view(-1)\n        y_flat = y.view(-1)\n        nbytes = token_bytes[y_flat]\n        mask = nbytes > 0\n        total_nats += (loss_flat * mask).sum().item()\n        total_bytes += nbytes.sum().item()\n    return total_nats / (math.log(2) * total_bytes)"
+        }
+      ],
+      "explanation": "Why bits per byte instead of the usual cross-entropy loss? Because BPB is independent of vocabulary size. If the agent changes the architecture in a way that affects tokenization, cross-entropy values would be incomparable — a model with 8K vocab tokens produces different per-token loss than one with 32K.\n\nBPB normalizes by actual byte count: line 360 looks up how many UTF-8 bytes each target token represents, line 361 creates a mask excluding special tokens (which have zero bytes), and line 364 converts the accumulated nats to bits by dividing by `log(2) * total_bytes`. The `@torch.no_grad()` decorator and fixed `MAX_SEQ_LEN` ensure evaluation is deterministic and comparable across all experiments."
+    },
+    {
+      "id": "chapter-5",
+      "label": "GPT Config",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 31,
+          "endLine": 39,
+          "content": "@dataclass\nclass GPTConfig:\n    sequence_len: int = 2048\n    vocab_size: int = 32768\n    n_layer: int = 12\n    n_head: int = 6\n    n_kv_head: int = 6\n    n_embd: int = 768\n    window_pattern: str = \"SSSL\""
+        },
+        {
+          "filePath": "train.py",
+          "startLine": 432,
+          "endLine": 450,
+          "content": "ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO\nHEAD_DIM = 128          # target head dimension for attention\nWINDOW_PATTERN = \"SSSL\" # sliding window pattern: L=full, S=half context\n\n# Optimization\nTOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step\nEMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)\nUNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)\nMATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)\nSCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)\nWEIGHT_DECAY = 0.2      # cautious weight decay for Muon\nADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2\nWARMUP_RATIO = 0.0      # fraction of time budget for LR warmup\nWARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown\nFINAL_LR_FRAC = 0.0     # final LR as fraction of initial\n\n# Model size\nDEPTH = 8               # number of transformer layers\nDEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)"
+        },
+        {
+          "filePath": "train.py",
+          "startLine": 468,
+          "endLine": 476,
+          "content": "def build_model_config(depth):\n    base_dim = depth * ASPECT_RATIO\n    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM\n    num_heads = model_dim // HEAD_DIM\n    return GPTConfig(\n        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,\n        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,\n        window_pattern=WINDOW_PATTERN,\n    )"
+        }
+      ],
+      "explanation": "`GPTConfig` (lines 31-39) is a compact dataclass holding the model's vital statistics. The clever part is `build_model_config` (lines 468-476): it derives the entire model geometry from a single number — `DEPTH`. Line 469 computes the base dimension as `depth * ASPECT_RATIO` (64), then line 470 rounds up to the nearest multiple of `HEAD_DIM` (128) to ensure clean head partitioning. With DEPTH=8, that gives a 512-dimensional model with 4 heads.\n\nThe hyperparameter block (lines 432-450) exposes everything the agent might want to tune. Notice the different learning rates for different parameter types — embeddings get 0.6, the unembedding head gets 0.004, matrix params get 0.04. This foreshadows the hybrid optimizer we'll see later. The \"one knob controls model size\" design is intentional: it gives the agent a simple lever for scaling experiments while keeping the architecture internally consistent."
+    },
+    {
+      "id": "chapter-6",
+      "label": "Attention Mechanics",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 76,
+          "endLine": 95,
+          "content": "    def forward(self, x, ve, cos_sin, window_size):\n        B, T, C = x.size()\n        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)\n        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)\n        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)\n\n        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head\n        if ve is not None:\n            ve = ve.view(B, T, self.n_kv_head, self.head_dim)\n            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))\n            v = v + gate.unsqueeze(-1) * ve\n\n        cos, sin = cos_sin\n        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)\n        q, k = norm(q), norm(k)\n\n        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)\n        y = y.contiguous().view(B, T, -1)\n        y = self.c_proj(y)\n        return y"
+        }
+      ],
+      "explanation": "`CausalSelfAttention.forward` packs several modern attention techniques into 20 lines. Lines 78-80 project inputs to queries, keys, and values. Lines 83-86 implement the ResFormer value residual: if this layer has a value embedding, it's mixed in with an input-dependent gate. The expression `2 * sigmoid(...)` ensures the gate ranges [0, 2], centered at 1.0 for neutral initialization.\n\nLines 89-90 apply rotary position embeddings (RoPE) — a relative position encoding that embeds positional information directly into the query and key vectors via rotation — followed by QK-normalization via RMS norm, a stability trick that prevents attention logits from growing unboundedly. Line 92 delegates the actual attention to Flash Attention 3, passing a `window_size` parameter that controls whether this layer uses full or sliding-window attention. The choice of FA3 over PyTorch's built-in scaled dot-product attention is significant: FA3 provides native sliding window support and superior performance on Hopper GPUs."
+    },
+    {
+      "id": "chapter-7",
+      "label": "Value Residuals",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 46,
+          "endLine": 48,
+          "content": "def has_ve(layer_idx, n_layer):\n    \"\"\"Returns True if layer should have Value Embedding (alternating, last always included).\"\"\"\n    return layer_idx % 2 == (n_layer - 1) % 2"
+        },
+        {
+          "filePath": "train.py",
+          "startLine": 136,
+          "endLine": 141,
+          "content": "        head_dim = config.n_embd // config.n_head\n        kv_dim = config.n_kv_head * head_dim\n        self.value_embeds = nn.ModuleDict({\n            str(i): nn.Embedding(config.vocab_size, kv_dim)\n            for i in range(config.n_layer) if has_ve(i, config.n_layer)\n        })"
+        },
+        {
+          "filePath": "train.py",
+          "startLine": 167,
+          "endLine": 172,
+          "content": "        for ve in self.value_embeds.values():\n            torch.nn.init.uniform_(ve.weight, -s, s)\n        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)\n        for block in self.transformer.h:\n            if block.attn.ve_gate is not None:\n                torch.nn.init.zeros_(block.attn.ve_gate.weight)"
+        }
+      ],
+      "explanation": "`has_ve` (lines 46-48) selects which layers get value embeddings — alternating layers, with the last layer always included. The modular arithmetic `layer_idx % 2 == (n_layer - 1) % 2` ensures the pattern always includes the final layer regardless of depth.\n\nIn `GPT.__init__` (lines 138-141), value embeddings are created only for selected layers, each mapping from vocab to the key-value dimension. The initialization on lines 169-172 is particularly thoughtful: gate weights start at zero, meaning `sigmoid(0) = 0.5`, scaled by the `2 *` factor in the forward pass gives exactly 1.0 — a neutral starting point. The model begins with value residuals contributing equally, then learns to strengthen or suppress them per-head during training."
+    },
+    {
+      "id": "chapter-8",
+      "label": "Window Patterns",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 194,
+          "endLine": 205,
+          "content": "    def _compute_window_sizes(self, config):\n        pattern = config.window_pattern.upper()\n        assert all(c in \"SL\" for c in pattern)\n        long_window = config.sequence_len\n        short_window = long_window // 2\n        char_to_window = {\"L\": (long_window, 0), \"S\": (short_window, 0)}\n        window_sizes = []\n        for layer_idx in range(config.n_layer):\n            char = pattern[layer_idx % len(pattern)]\n            window_sizes.append(char_to_window[char])\n        window_sizes[-1] = (long_window, 0)\n        return window_sizes"
+        }
+      ],
+      "explanation": "`_compute_window_sizes` translates a string pattern like \"SSSL\" into per-layer attention window sizes. \"S\" means half the sequence length, \"L\" means full context. The pattern repeats cyclically across layers (line 202), but line 204 overrides the last layer to always use full context.\n\nWith DEPTH=8 and pattern \"SSSL\", layers get: S, S, S, L, S, S, S, L. Three out of four layers use cheaper half-context attention, saving compute on the quadratic attention cost. This is a clean compute-quality tradeoff: most layers only need local context, while periodic global layers maintain long-range information flow."
+    },
+    {
+      "id": "chapter-9",
+      "label": "Blocks & Forward Pass",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 98,
+          "endLine": 120,
+          "content": "class MLP(nn.Module):\n    def __init__(self, config):\n        super().__init__()\n        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)\n        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)\n\n    def forward(self, x):\n        x = self.c_fc(x)\n        x = F.relu(x).square()\n        x = self.c_proj(x)\n        return x\n\n\nclass Block(nn.Module):\n    def __init__(self, config, layer_idx):\n        super().__init__()\n        self.attn = CausalSelfAttention(config, layer_idx)\n        self.mlp = MLP(config)\n\n    def forward(self, x, ve, cos_sin, window_size):\n        x = x + self.attn(norm(x), ve, cos_sin, window_size)\n        x = x + self.mlp(norm(x))\n        return x"
+        },
+        {
+          "filePath": "train.py",
+          "startLine": 267,
+          "endLine": 290,
+          "content": "    def forward(self, idx, targets=None, reduction='mean'):\n        B, T = idx.size()\n        assert T <= self.cos.size(1)\n        cos_sin = self.cos[:, :T], self.sin[:, :T]\n\n        x = self.transformer.wte(idx)\n        x = norm(x)\n        x0 = x\n        for i, block in enumerate(self.transformer.h):\n            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0\n            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None\n            x = block(x, ve, cos_sin, self.window_sizes[i])\n        x = norm(x)\n\n        softcap = 15\n        logits = self.lm_head(x)\n        logits = logits.float()\n        logits = softcap * torch.tanh(logits / softcap)\n\n        if targets is not None:\n            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),\n                                   ignore_index=-1, reduction=reduction)\n            return loss\n        return logits"
+        }
+      ],
+      "explanation": "The `MLP` uses an unusual activation on line 106: `F.relu(x).square()` — ReLU squared, which produces sparser, sharper activations than GELU. `Block` follows pre-norm residual style: normalize, attend, add back; normalize, MLP, add back (lines 117-119).\n\nThe real action is in `GPT.forward`. After embedding and normalizing (lines 272-273), `x0` saves the initial representation. The loop at line 275 applies per-layer residual scaling: `resid_lambdas[i] * x + x0_lambdas[i] * x0` blends the running residual stream with the original embedding. This \"x0 skip connection\" helps gradient flow in deep networks — the model can always reference back to the raw input. The `x0_lambdas` start at 0.1 (a gentle contribution that grows during training).\n\nLines 281-284 apply logit softcapping: `15 * tanh(logits / 15)` squashes output logits into [-15, 15], preventing training instability from logit explosions. This trick is borrowed from Google's Gemma architecture."
+    },
+    {
+      "id": "chapter-10",
+      "label": "Hybrid Optimizer",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 235,
+          "endLine": 265,
+          "content": "    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,\n                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):\n        model_dim = self.config.n_embd\n        matrix_params = list(self.transformer.h.parameters())\n        value_embeds_params = list(self.value_embeds.parameters())\n        embedding_params = list(self.transformer.wte.parameters())\n        lm_head_params = list(self.lm_head.parameters())\n        resid_params = [self.resid_lambdas]\n        x0_params = [self.x0_lambdas]\n        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +\n            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))\n        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)\n        dmodel_lr_scale = (model_dim / 768) ** -0.5\n        print(f\"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}\")\n        param_groups = [\n            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),\n            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),\n            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),\n            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),\n            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),\n        ]\n        for shape in sorted({p.shape for p in matrix_params}):\n            group_params = [p for p in matrix_params if p.shape == shape]\n            param_groups.append(dict(\n                kind='muon', params=group_params, lr=matrix_lr,\n                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,\n            ))\n        optimizer = MuonAdamW(param_groups)\n        for group in optimizer.param_groups:\n            group[\"initial_lr\"] = group[\"lr\"]\n        return optimizer"
+        }
+      ],
+      "explanation": "`setup_optimizer` reveals a key design philosophy: different parameter types deserve different optimizers. The method creates six distinct parameter groups. Embeddings, the unembedding head, residual scalars, and x0 scalars all get AdamW with carefully differentiated learning rates (lines 249-254). Note line 247: all AdamW learning rates are scaled by `1/sqrt(d_model/768)`, maintaining stable training dynamics when the agent changes model width.\n\nThe transformer's 2D weight matrices are grouped by shape (lines 256-261) and assigned to Muon — a recently-developed optimizer that uses spectral methods. The shape-based grouping is important: Muon stacks same-shaped matrices into a single tensor for batched operations. The separation is principled: Muon's orthogonalization only makes sense for 2D matrices, while scalars and embeddings need Adam's adaptive step sizes. Line 264 saves each group's initial LR for the schedule system to reference later."
+    },
+    {
+      "id": "chapter-11",
+      "label": "Polar Decomposition",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 296,
+          "endLine": 335,
+          "content": "polar_express_coeffs = [\n    (8.156554524902461, -22.48329292557795, 15.878769915207462),\n    (4.042929935166739, -2.808917465908714, 0.5000178451051316),\n    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),\n    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),\n    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),\n]\n\n@torch.compile(dynamic=False, fullgraph=True)\ndef adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):\n    p.mul_(1 - lr_t * wd_t)\n    exp_avg.lerp_(grad, 1 - beta1_t)\n    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)\n    bias1 = 1 - beta1_t ** step_t\n    bias2 = 1 - beta2_t ** step_t\n    denom = (exp_avg_sq / bias2).sqrt() + eps_t\n    step_size = lr_t / bias1\n    p.add_(exp_avg / denom, alpha=-step_size)\n\n@torch.compile(dynamic=False, fullgraph=True)\ndef muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,\n                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):\n    # Nesterov momentum\n    momentum = momentum_t.to(stacked_grads.dtype)\n    momentum_buffer.lerp_(stacked_grads, 1 - momentum)\n    g = stacked_grads.lerp_(momentum_buffer, momentum)\n    # Polar express orthogonalization\n    X = g.bfloat16()\n    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)\n    if g.size(-2) > g.size(-1):\n        for a, b, c in polar_express_coeffs[:ns_steps]:\n            A = X.mT @ X\n            B = b * A + c * (A @ A)\n            X = a * X + X @ B\n    else:\n        for a, b, c in polar_express_coeffs[:ns_steps]:\n            A = X @ X.mT\n            B = b * A + c * (A @ A)\n            X = a * X + B @ X\n    g = X"
+        }
+      ],
+      "explanation": "Here's the mathematical core of the Muon optimizer. Both `adamw_step_fused` (lines 305-313) and `muon_step_fused` (lines 316-335) are decorated with `@torch.compile(dynamic=False, fullgraph=True)` — compiled as single fused CUDA kernels for maximum throughput.\n\nAfter computing Nesterov momentum (lines 319-321), lines 323-335 perform the \"Polar Express\" — a polynomial approximation of the matrix polar decomposition. Instead of computing an expensive SVD, this uses pre-computed coefficients (lines 296-302) to iteratively orthogonalize the gradient. The branch at line 325 chooses between left and right multiplication depending on matrix aspect ratio — always multiplying on the smaller side for efficiency. Each iteration applies `X = a*X + X @ B` where B is a degree-2 polynomial of `X^T @ X`. Five iterations gives a good approximation of the nearest orthogonal matrix. The result is a gradient update that preserves the spectral structure of weight matrices — intuitively, it prevents any single direction from dominating the update."
+    },
+    {
+      "id": "chapter-12",
+      "label": "Performance Tricks",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 355,
+          "endLine": 371,
+          "content": "class MuonAdamW(torch.optim.Optimizer):\n    \"\"\"Combined optimizer: Muon for 2D matrix params, AdamW for others.\"\"\"\n\n    def __init__(self, param_groups):\n        super().__init__(param_groups, defaults={})\n        # 0-D CPU tensors to avoid torch.compile recompilation when values change\n        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")\n        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")\n        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")\n        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")\n        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")\n        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")\n        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")\n        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")\n        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")\n        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device=\"cpu\")"
+        },
+        {
+          "filePath": "train.py",
+          "startLine": 591,
+          "endLine": 598,
+          "content": "    # GC management (Python's GC causes ~500ms stalls)\n    if step == 0:\n        gc.collect()\n        gc.freeze()\n        gc.disable()\n    elif (step + 1) % 5000 == 0:\n        gc.collect()"
+        }
+      ],
+      "explanation": "Two clever tricks squeeze every millisecond out of the 5-minute budget. In `MuonAdamW.__init__` (lines 360-370), every hyperparameter that changes during training gets a 0-dimensional CPU tensor. Why? Because `torch.compile` with `dynamic=False` recompiles whenever it sees a new concrete Python value. By wrapping hyperparameters in persistent tensors and using `.fill_()` to update them, the compiled graph sees the same tensor objects every step — zero recompilation overhead.\n\nLines 591-598 tackle a different enemy: Python's garbage collector. After step 0, all surviving objects are frozen and GC is disabled entirely. The comment explains the stakes: GC stalls take ~500ms, which is significant when your entire budget is 300 seconds. GC only runs every 5000 steps as a safety valve against memory leaks."
+    },
+    {
+      "id": "chapter-13",
+      "label": "Time Budget Loop",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 542,
+          "endLine": 564,
+          "content": "while True:\n    torch.cuda.synchronize()\n    t0 = time.time()\n    for micro_step in range(grad_accum_steps):\n        with autocast_ctx:\n            loss = model(x, y)\n        train_loss = loss.detach()\n        loss = loss / grad_accum_steps\n        loss.backward()\n        x, y, epoch = next(train_loader)\n\n    # Progress and schedules\n    progress = min(total_training_time / TIME_BUDGET, 1.0)\n    lrm = get_lr_multiplier(progress)\n    muon_momentum = get_muon_momentum(step)\n    muon_weight_decay = get_weight_decay(progress)\n    for group in optimizer.param_groups:\n        group[\"lr\"] = group[\"initial_lr\"] * lrm\n        if group['kind'] == 'muon':\n            group[\"momentum\"] = muon_momentum\n            group[\"weight_decay\"] = muon_weight_decay\n    optimizer.step()\n    model.zero_grad(set_to_none=True)"
+        },
+        {
+          "filePath": "train.py",
+          "startLine": 577,
+          "endLine": 603,
+          "content": "    if step > 10:\n        total_training_time += dt\n\n    # Logging\n    ema_beta = 0.9\n    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f\n    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))\n    pct_done = 100 * progress\n    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)\n    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS\n    remaining = max(0, TIME_BUDGET - total_training_time)\n\n    print(f\"\\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    \", end=\"\", flush=True)\n\n    # GC management (Python's GC causes ~500ms stalls)\n    if step == 0:\n        gc.collect()\n        gc.freeze()\n        gc.disable()\n    elif (step + 1) % 5000 == 0:\n        gc.collect()\n\n    step += 1\n\n    # Time's up — but only stop after warmup steps so we don't count compilation\n    if step > 10 and total_training_time >= TIME_BUDGET:\n        break"
+        }
+      ],
+      "explanation": "The training loop is wall-clock driven, not step-count driven — and that's the whole point. Each iteration runs gradient accumulation microsteps (lines 545-551) under bf16 autocast, computes the time-based progress fraction (line 554), updates all schedules accordingly (lines 555-562), then takes one optimizer step.\n\nThe termination condition on line 602 is the crux: `if step > 10 and total_training_time >= TIME_BUDGET: break`. The `step > 10` guard (mirrored on line 577 where time only starts accumulating after step 10) excludes the first iterations from the budget. Those early steps are dominated by `torch.compile`'s JIT compilation overhead, not actual training. This ensures the 5-minute budget measures real training compute, making results fair across different models that may trigger different compilation paths. Between the two snippets, the loop also includes a fast-fail check: if loss exceeds 100, it aborts immediately — no point wasting minutes on a diverged run."
+    },
+    {
+      "id": "chapter-14",
+      "label": "Learning Schedules",
+      "snippets": [
+        {
+          "filePath": "train.py",
+          "startLine": 517,
+          "endLine": 531,
+          "content": "def get_lr_multiplier(progress):\n    if progress < WARMUP_RATIO:\n        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0\n    elif progress < 1.0 - WARMDOWN_RATIO:\n        return 1.0\n    else:\n        cooldown = (1.0 - progress) / WARMDOWN_RATIO\n        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC\n\ndef get_muon_momentum(step):\n    frac = min(step / 300, 1)\n    return (1 - frac) * 0.85 + frac * 0.95\n\ndef get_weight_decay(progress):\n    return WEIGHT_DECAY * (1 - progress)"
+        }
+      ],
+      "explanation": "Three compact functions control the training dynamics. `get_lr_multiplier` (lines 517-524) implements warmup-plateau-cooldown: linear ramp, constant middle, then linear decay to `FINAL_LR_FRAC` (0.0 by default — full cooldown to zero). `get_muon_momentum` ramps from 0.85 to 0.95 over the first 300 steps. `get_weight_decay` linearly decays to zero by the end of training.\n\nUsing time-fraction (`progress`) rather than step count is essential to the autoresearch design: if the agent changes model size or batch size, the number of steps per 5-minute window changes, but schedules still span the full budget proportionally."
+    },
+    {
+      "id": "chapter-15",
+      "label": "Design Synthesis",
+      "snippets": [],
+      "explanation": "Autoresearch's elegance comes from its constraints. A fixed 5-minute wall-clock budget makes every experiment directly comparable, regardless of what the agent changes. A vocab-size-independent metric (BPB) ensures even radical architectural changes get fair evaluation. A single editable file (`train.py`) keeps the scope manageable and diffs reviewable. And the immutable evaluation harness in `prepare.py` prevents the agent from gaming the metric.\n\nWithin these constraints, the training code is surprisingly sophisticated. The GPT model combines modern techniques — RoPE, Flash Attention 3 with sliding windows, value residuals, ReLU-squared activations, logit softcapping, and x0 skip connections — into a clean, single-file implementation. The MuonAdamW optimizer matches each parameter type to its ideal update rule, while performance tricks like 0-D tensor wrappers and GC freezing squeeze every second out of the budget.\n\nThe deepest insight may be the meta-level one: `program.md` is \"source code\" for a research organization. The human doesn't write Python — they write English that programs an autonomous research loop. The agent iterates on `train.py`; the human iterates on `program.md`. It's research all the way down."
+    }
+  ]
+}

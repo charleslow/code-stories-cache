@@ -67,6 +67,12 @@
       "createdAt": "2026-03-03T12:00:00.000Z"
     },
     {
+      "id": "autoresearch-end-to-end",
+      "title": "Autoresearch End to End: Autonomous AI-Driven LLM Training",
+      "commitHash": "068d93da75aa45f72ba482046f108241aaaf1b8e",
+      "createdAt": "2026-03-09T20:35:00.000Z"
+    },
+    {
       "id": "picoclaw-multi-session",
       "title": "Breaking the Sequential Bottleneck: Multi-Session Processing in PicoClaw",
       "createdAt": "2026-03-09T12:00:00.000Z"
