@@ -76,6 +76,12 @@
       "id": "picoclaw-multi-session",
       "title": "Breaking the Sequential Bottleneck: Multi-Session Processing in PicoClaw",
       "createdAt": "2026-03-09T12:00:00.000Z"
+    },
+    {
+      "id": "hf-datasets-jsonl-casting",
+      "title": "From JSONL to Arrow: How datasets Casts Column Types (and Why \"string to null\" Fails)",
+      "commitHash": "68294abb004a445f50ead07cd1e95db9bd47e4de",
+      "createdAt": "2026-03-18T12:00:00.000Z"
     }
   ]
 }

@@ -16,6 +16,7 @@ A personal cache of AI-generated code stories for public repositories I want to 
 - [How Qwen 3.5 Blends Linear and Full Attention](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=llms-from-scratch-qwen35)
 - [Breaking the Sequential Bottleneck: Multi-Session Processing in PicoClaw](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=picoclaw-multi-session)
 - [Autoresearch End to End: Autonomous AI-Driven LLM Training](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=autoresearch-end-to-end)
+- [From JSONL to Arrow: How datasets Casts Column Types (and Why "string to null" Fails)](https://charleslow.github.io/code-stories/?repo=charleslow/code-stories-cache&story=hf-datasets-jsonl-casting)
 
 ## What is a Code Story?
 
